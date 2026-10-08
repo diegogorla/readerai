@@ -1,0 +1,11 @@
+{
+  "name": "Reader AI",
+  "description": "Leitor inteligente de documentos com voz natural de IA (Gemini, Antonio e OpenAI), transcrição Whisper, lista com alarmes e assinaturas.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ],
+  "prompt": ""
+}

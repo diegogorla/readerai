@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta name="theme-color" content="#4f46e5" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="LeitorAI" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reader AI</title>
+    <meta name="description" content="Leitor inteligente de documentos com voz natural de IA (Gemini, Antonio e OpenAI), transcrição Whisper, lista com alarmes e assinaturas." />
+    <link rel="icon" type="image/jpeg" href="/logo.jpg">
+    <!-- Paddle Billing v2 SDK (Paddle.js) -->
+    <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Dependencies for document parsing and export will be loaded dynamically -->
+    
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@^19.1.0",
+        "react-dom/client": "https://esm.sh/react-dom@^19.1.0/client",
+        "@google/genai": "https://esm.sh/@google/genai@^1.8.0",
+        "react-dom/": "https://esm.sh/react-dom@^19.1.0/",
+        "react/": "https://esm.sh/react@^19.1.0/"
+      }
+    }
+    </script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body class="bg-gray-200 dark:bg-gray-900">
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+</body>
+</html>

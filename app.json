@@ -1,0 +1,62 @@
+{
+  "expo": {
+    "name": "Leitor AI",
+    "slug": "leitor-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./public/apple-touch-icon.png",
+    "scheme": "leitorai",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./public/pwa-512x512.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#09090b"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.dgorla.readerai",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "O Leitor AI necessita de acesso ao microfone para permitir o ditado de itens por voz e transcrição de áudio via Whisper e Gemini.",
+        "NSSpeechRecognitionUsageDescription": "Utilizado para reconhecimento de fala e inclusão de itens na lista com comandos de voz.",
+        "UIBackgroundModes": [
+          "audio"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "entitlements": {
+        "com.apple.developer.in-app-payments": []
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./public/pwa-192x192.png",
+        "backgroundColor": "#09090b"
+      },
+      "package": "com.dgorla.readerai",
+      "versionCode": 1,
+      "permissions": [
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "INTERNET"
+      ]
+    },
+    "web": {
+      "favicon": "./public/favicon.ico"
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Permita que o Leitor AI acesse seu microfone para ditar itens e transcrever áudio."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "7103f7fb-7765-41b7-b9f1-cf7187ac21ec"
+      }
+    }
+  }
+}
