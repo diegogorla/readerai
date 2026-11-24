@@ -16,55 +16,41 @@ if (getApps().length === 0) {
 
 const db = getFirestore(undefined, "ai-studio-readerai-7103f7fb-7765-41b7-b9f1-cf7187ac21ec");
 
-// In-Memory Verified Sessions Store: sessionToken -> { uid, email, name }
-const verifiedSessions = new Map<string, { uid: string; email: string; name: string }>();
-verifiedSessions.set('session_dgorla_pro', { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' });
-
-// Middleware to verify Firebase Auth Token or Session Token
+// Middleware to strictly verify Firebase ID Token (works on all projects without IAM)
 async function requireAuth(req: any, res: any, next: any) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // Default to Dgorla Pro user so user is never blocked by screens asking for values
-    req.user = { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' };
-    return next();
+    return res.status(401).json({ error: 'Autenticação necessária. Faça login com sua conta Google.' });
   }
-  const token = authHeader.split('Bearer ')[1];
-
-  // 1. Check if it's a verified session token
-  if (token === 'session_dgorla_pro' || token.startsWith('session_') || token.startsWith('2fa_session_')) {
-    const sessionData = verifiedSessions.get(token) || { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' };
-    req.user = sessionData;
-    return next();
+  const token = authHeader.split('Bearer ')[1]?.trim();
+  if (!token) {
+    return res.status(401).json({ error: 'Token de autenticação ausente.' });
   }
 
-  // 2. Check Firebase ID Token
   try {
     const decodedToken = await getAuth().verifyIdToken(token);
     req.user = decodedToken;
-    next();
-  } catch (error) {
-    req.user = { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' };
     return next();
+  } catch (error) {
+    console.warn('[Auth] Invalid Firebase ID token:', (error as any)?.message || error);
+    return res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente com o Google.' });
   }
 }
 
-// Optional Auth: populates req.user if token is present, does not block if absent
+// Optional Auth: verifies Firebase ID token if provided, allows anonymous access otherwise
 async function optionalAuth(req: any, _res: any, next: any) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.split('Bearer ')[1];
-    if (token === 'session_dgorla_pro' || token.startsWith('session_') || token.startsWith('2fa_session_')) {
-      req.user = verifiedSessions.get(token) || { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' };
-      return next();
-    }
-    try {
-      const decoded = await getAuth().verifyIdToken(token);
-      req.user = decoded;
-    } catch {
-      req.user = { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' };
+    const token = authHeader.split('Bearer ')[1]?.trim();
+    if (token) {
+      try {
+        req.user = await getAuth().verifyIdToken(token);
+      } catch {
+        req.user = null;
+      }
     }
   } else {
-    req.user = { uid: 'dgorla_official', email: 'dgorla@gmail.com', name: 'Dgorla' };
+    req.user = null;
   }
   next();
 }
@@ -90,9 +76,68 @@ function getGeminiClient(): GoogleGenAI {
     if (!apiKey) {
       throw new Error("GEMINI_API_KEY environment variable is required");
     }
-    geminiClient = new GoogleGenAI({ apiKey });
+    geminiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
   }
   return geminiClient;
+}
+
+const OPENAI_ALLOWED_VOICES = new Set([
+  'alloy',
+  'ash',
+  'coral',
+  'echo',
+  'fable',
+  'nova',
+  'onyx',
+  'sage',
+  'shimmer',
+]);
+
+function getOpenAiApiKey(): string | undefined {
+  const key = process.env.OPENAI_API_KEY || process.env.OPENAI_ENVIRONMENT_KEY;
+  return key?.trim() || undefined;
+}
+
+async function callGeminiWithFallback(
+  ai: GoogleGenAI,
+  params: { contents: any; config?: any; models?: string[] }
+) {
+  const modelsToTry = params.models || [
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite',
+  ];
+
+  let lastError: any = null;
+  for (const model of modelsToTry) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: params.contents,
+          config: params.config,
+        });
+        return response;
+      } catch (err: any) {
+        lastError = err;
+        const msg = String(err?.message || err || '');
+        const isTransient = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('429');
+        console.warn(`[Gemini] Model ${model} (attempt ${attempt + 1}) failed:`, msg);
+        if (isTransient && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 600));
+          continue;
+        }
+        break;
+      }
+    }
+  }
+  throw lastError || new Error("O serviço de IA está temporariamente indisponível. Tente novamente em instantes.");
 }
 
 // SSRF Protection Helper
@@ -206,14 +251,8 @@ async function startServer() {
       // Code is valid! Consume it
       twoFactorCodes.delete(normalizedEmail);
 
-      // Generate consistent UID and session token
+      // Generate consistent UID
       const uid = 'user_' + Buffer.from(normalizedEmail).toString('hex').slice(0, 20);
-      const sessionToken = `2fa_session_${uid}_${Date.now()}`;
-      verifiedSessions.set(sessionToken, {
-        uid,
-        email: normalizedEmail,
-        name: normalizedEmail.split('@')[0]
-      });
 
       // Find or create Firebase user
       let userRecord = null;
@@ -255,7 +294,6 @@ async function startServer() {
       res.json({
         success: true,
         customToken,
-        sessionToken,
         user: {
           uid: userRecord?.uid || uid,
           email: normalizedEmail,
@@ -482,28 +520,12 @@ async function startServer() {
     });
   });
 
-  // Secure Checkout Activation Endpoint
-  app.post("/api/checkout", requireAuth, async (req: any, res) => {
-    try {
-      const { planType = 'monthly', currency = 'BRL', provider = 'paddle' } = req.body;
-      const userRef = db.collection('users').doc(req.user.uid);
-      
-      await userRef.set({
-        plan: 'pro',
-        planType,
-        currency,
-        provider,
-        upgradedAt: new Date().toISOString()
-      }, { merge: true });
-
-      res.json({
-        success: true,
-        message: 'Assinatura Pro ativada com sucesso! Você agora tem acesso ilimitado a vozes naturais, alarmes e ditado por voz.'
-      });
-    } catch (error) {
-      console.error("Checkout activation error:", error);
-      res.status(500).json({ error: 'Falha ao processar checkout' });
-    }
+  // Direct client self-upgrade disabled: Pro plan activation must come from verified Paddle / RevenueCat webhooks
+  app.post("/api/checkout", requireAuth, async (_req: any, res) => {
+    return res.status(403).json({
+      error: 'WEBHOOK_REQUIRED',
+      message: 'A ativação do Plano Pro ocorre automaticamente após a confirmação segura do pagamento via webhook (Paddle ou RevenueCat).'
+    });
   });
 
   // Webhook Receiver for Paddle (Paddle Billing v2) & RevenueCat
@@ -515,10 +537,15 @@ async function startServer() {
       const payload = req.body;
       const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
 
-      // Verify Paddle signature if secret is provided
+      const revenueCatAuthHeader = req.headers.authorization as string | undefined;
+      const revenueCatSecret = process.env.REVENUECAT_WEBHOOK_AUTH_TOKEN;
+
+      let verified = false;
+
+      // 1. Verify Paddle HMAC-SHA256 signature
       if (signatureHeader && webhookSecret) {
         try {
-          const parts = signatureHeader.split(';').reduce((acc: any, part: string) => {
+          const parts = signatureHeader.split(';').reduce((acc: Record<string, string>, part: string) => {
             const [k, v] = part.split('=');
             if (k && v) acc[k.trim()] = v.trim();
             return acc;
@@ -528,9 +555,10 @@ async function startServer() {
           const h1 = parts['h1'];
           if (ts && h1) {
             const expectedHash = crypto.createHmac('sha256', webhookSecret).update(`${ts}:${rawBody}`).digest('hex');
-            if (expectedHash !== h1) {
-              console.warn("[Paddle Webhook] Invalid signature match");
-              return res.status(401).json({ error: 'Invalid Paddle webhook signature' });
+            const expectedBuf = Buffer.from(expectedHash, 'hex');
+            const receivedBuf = Buffer.from(h1, 'hex');
+            if (expectedBuf.length === receivedBuf.length && crypto.timingSafeEqual(expectedBuf, receivedBuf)) {
+              verified = true;
             }
           }
         } catch (sigErr) {
@@ -538,27 +566,45 @@ async function startServer() {
         }
       }
 
+      // 2. Verify RevenueCat Authorization header
+      if (!verified && revenueCatAuthHeader && revenueCatSecret) {
+        const provided = revenueCatAuthHeader.replace(/^Bearer\s+/i, '').trim();
+        const a = Buffer.from(provided);
+        const b = Buffer.from(revenueCatSecret);
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+          verified = true;
+        }
+      }
+
+      if (!verified) {
+        return res.status(401).json({ error: 'Assinatura de webhook inválida ou segredo não configurado.' });
+      }
+
       console.log("[Payment Webhook Event]", payload.event_type || payload.event?.type || "unknown");
 
       const eventType = payload.event_type || payload.event?.type;
       const customData = payload.data?.custom_data || {};
-      const targetUserId = customData.userId;
-      const email = payload.data?.customer?.email || payload.event?.app_user_id || payload.email;
+      const targetUserId = customData.userId || payload.event?.app_user_id;
+      const email = payload.data?.customer?.email || payload.email;
       const paddleCustomerId = payload.data?.customer_id;
       const paddleSubscriptionId = payload.data?.id;
 
-      // Handle subscription events per paddle-subscription-sync skill
+      // Handle subscription events for Paddle Billing v2 & RevenueCat
       const isActivationEvent = 
         eventType === 'subscription.created' ||
         eventType === 'subscription.updated' ||
         eventType === 'subscription.activated' ||
         eventType === 'transaction.completed' ||
         eventType === 'transaction.paid' ||
-        !eventType; // fallback for simulated webhooks
+        eventType === 'INITIAL_PURCHASE' ||
+        eventType === 'RENEWAL' ||
+        eventType === 'UNCANCELLATION';
 
       const isCancellationEvent =
         eventType === 'subscription.canceled' ||
-        eventType === 'subscription.past_due';
+        eventType === 'subscription.past_due' ||
+        eventType === 'EXPIRATION' ||
+        eventType === 'CANCELLATION';
 
       let userRef: any = null;
 
@@ -875,8 +921,7 @@ async function startServer() {
 
         let genAIResponse;
         try {
-          genAIResponse = await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
+          genAIResponse = await callGeminiWithFallback(ai, {
             contents: [
               { text: prompt },
               { text: `Page Title Hint: ${preTitle}\nContent HTML: ${preContent.substring(0, 50000)}` }
@@ -899,18 +944,8 @@ async function startServer() {
               }
             }
           });
-        } catch (flashErr) {
-          console.warn("Gemini 3.8 flash error, trying gemini-3.1-flash-lite:", flashErr);
-          genAIResponse = await ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite',
-            contents: [
-              { text: prompt },
-              { text: `Page Title Hint: ${preTitle}\nContent HTML: ${preContent.substring(0, 50000)}` }
-            ],
-            config: {
-              responseMimeType: "application/json",
-            }
-          });
+        } catch (aiErr) {
+          console.warn("AI cleaning fallback to precleaned HTML due to high demand:", aiErr);
         }
 
         const resultText = genAIResponse?.text?.trim() || "{}";
@@ -939,48 +974,47 @@ async function startServer() {
   
   app.post("/api/gemini/generate-notes", requireAuth, async (req, res) => {
     try {
-      const { htmlContent } = req.body;
-      if (!htmlContent) {
+      const { htmlContent, isSelection = false } = req.body;
+      if (!htmlContent || !String(htmlContent).trim()) {
         return res.status(400).json({ error: "Conteúdo é obrigatório" });
       }
 
       const ai = getGeminiClient();
-      const prompt = `Analyze the following HTML content and provide a concise summary, key insights, and structured study notes in Portuguese. Format the output as clean HTML using <h2>, <h3>, <ul>, <li>, <strong>, and <p> tags. Do not include markdown codeblocks (\`\`\`html).
+      const scopeHint = isSelection
+        ? "Analyze the following selected excerpt and provide a concise summary, key insights, and structured study notes in Brazilian Portuguese."
+        : "Analyze the following document content and provide a concise summary, key insights, and structured study notes in Brazilian Portuguese.";
+
+      const prompt = `${scopeHint}
+Format the output as clean HTML using <h2>, <h3>, <ul>, <li>, <strong>, and <p> tags.
+Do NOT include markdown code blocks (\`\`\`html) or conversational filler outside the HTML.
 
 Content:
-${htmlContent.substring(0, 50000)}`;
+${String(htmlContent).substring(0, 50000)}`;
 
-      let response;
-      try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: prompt,
-        });
-      } catch (err) {
-        console.warn("generate-notes fallback to gemini-3.1-flash-lite:", err);
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: prompt,
-        });
-      }
+      const response = await callGeminiWithFallback(ai, {
+        contents: prompt,
+      });
 
       let notesHtml = (response.text || "").trim();
-      const fenceRegex = /^```(?:html)?\s*\n?([\s\S]*?)\n?\s*```$/;
+      const fenceRegex = /^```(?:html)?\s*\n?([\s\S]*?)\n?\s*```$/i;
       const match = notesHtml.match(fenceRegex);
       if (match && match[1]) {
         notesHtml = match[1].trim();
       }
+      if (!notesHtml) {
+        return res.status(502).json({ error: "A IA não retornou notas para este conteúdo. Tente novamente." });
+      }
       res.json({ notes: notesHtml });
     } catch (error: any) {
       console.error("Gemini Generate Notes Error:", error);
-      res.status(500).json({ error: error.message || "Falha ao gerar notas com Gemini" });
+      res.status(500).json({ error: error.message || "Falha ao gerar notas com IA" });
     }
   });
 
   app.post("/api/gemini/translate", requireAuth, async (req, res) => {
     try {
-      const { htmlContent, targetLanguage = "pt-BR" } = req.body;
-      if (!htmlContent) {
+      const { htmlContent, targetLanguage = "pt-BR", isSelection = false } = req.body;
+      if (!htmlContent || !String(htmlContent).trim()) {
         return res.status(400).json({ error: "Conteúdo é obrigatório" });
       }
 
@@ -996,34 +1030,37 @@ ${htmlContent.substring(0, 50000)}`;
       };
       const targetLangName = languageMap[targetLanguage] || targetLanguage;
 
-      const prompt = `You are a professional document translator. Translate all human-readable text in the provided HTML into ${targetLangName}.
+      const prompt = isSelection
+        ? `You are a professional translator. Translate ONLY the following selected excerpt into ${targetLangName}.
 CRITICAL REQUIREMENTS:
-1. Retain all HTML formatting and tags (<p>, <h1>, <h2>, <h3>, <h4>, <ul>, <ol>, <li>, <strong>, <em>, <span>, <div>, etc.) intact with identical structure.
+1. Preserve any inline HTML tags present in the input (such as <strong>, <em>, <mark>, <a>, <br>, <p>, etc.) with their attributes intact.
+2. If the input is plain text without block tags, return ONLY the translated plain text without wrapping it in <p>, <div>, or any extra tags.
+3. Preserve leading/trailing meaning accurately and naturally.
+4. Return ONLY the translated excerpt. Do NOT include markdown code fences (\`\`\`html), quotes, or explanations.
+
+Excerpt to translate:
+${String(htmlContent)}`
+        : `You are a professional document translator. Translate all human-readable text in the provided HTML into ${targetLangName}.
+CRITICAL REQUIREMENTS:
+1. Retain all HTML formatting and tags (<p>, <h1>, <h2>, <h3>, <h4>, <ul>, <ol>, <li>, <strong>, <em>, <span>, <div>, <mark>, etc.) intact with identical structure.
 2. Only translate the text content between tags. Do not alter HTML attributes, class names, or IDs.
 3. Return ONLY the translated HTML content. Do NOT include markdown code fences (\`\`\`html) or conversational filler before or after.
 
 HTML Content:
-${htmlContent}`;
+${String(htmlContent)}`;
 
-      let response;
-      try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: prompt,
-        });
-      } catch (err) {
-        console.warn("translate fallback to gemini-3.1-flash-lite:", err);
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: prompt,
-        });
-      }
+      const response = await callGeminiWithFallback(ai, {
+        contents: prompt,
+      });
 
       let translatedHtml = (response.text || "").trim();
-      const fenceRegex = /^```(?:html)?\s*\n?([\s\S]*?)\n?\s*```$/;
+      const fenceRegex = /^```(?:html)?\s*\n?([\s\S]*?)\n?\s*```$/i;
       const match = translatedHtml.match(fenceRegex);
       if (match && match[1]) {
         translatedHtml = match[1].trim();
+      }
+      if (!translatedHtml) {
+        return res.status(502).json({ error: "A IA não retornou a tradução. Tente novamente." });
       }
       res.json({ translated: translatedHtml });
     } catch (error: any) {
@@ -1043,21 +1080,31 @@ ${htmlContent}`;
         return res.status(400).json({ error: 'Dados de áudio em Base64 são obrigatórios' });
       }
 
-      // Check if user is Pro
-      const userRef = db.collection('users').doc(req.user.uid);
-      const userDoc = await userRef.get();
-      const isPro = userDoc.data()?.plan === 'pro';
-
-      if (!isPro) {
-        return res.status(403).json({
-          error: 'PRO_FEATURE',
-          requiresSubscription: true,
-          message: 'O ditado por comando de voz e transcrição de áudio são exclusivos dos planos pagos.'
-        });
+      // Verify Pro status when Admin SDK Firestore access is available (bootstrap admin always allowed)
+      const isBootstrapAdmin =
+        req.user?.email_verified === true &&
+        String(req.user?.email || '').toLowerCase() === 'dgorla@gmail.com';
+      if (!isBootstrapAdmin) {
+        try {
+          const userRef = db.collection('users').doc(req.user.uid);
+          const userDoc = await userRef.get();
+          const isPro = userDoc.data()?.plan === 'pro';
+          if (!isPro) {
+            return res.status(403).json({
+              error: 'PRO_FEATURE',
+              requiresSubscription: true,
+              message: 'O ditado por comando de voz e transcrição de áudio são exclusivos dos planos pagos.'
+            });
+          }
+        } catch (adminErr: any) {
+          console.warn('[Transcribe] Skipping Admin SDK Firestore check on Starter Tier:', adminErr?.message || adminErr);
+        }
       }
 
       // 1. Try OpenAI Whisper if requested and key is present
-      if (engine === 'whisper' && process.env.OPENAI_API_KEY) {
+      const openAiKey = getOpenAiApiKey();
+      const tryOpenAiWhisper = async (): Promise<string | null> => {
+        if (!openAiKey) return null;
         try {
           const audioBuffer = Buffer.from(audioBase64, 'base64');
           const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('wav') ? 'wav' : 'webm';
@@ -1070,19 +1117,27 @@ ${htmlContent}`;
           const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+              'Authorization': `Bearer ${openAiKey}`
             },
             body: formData
           });
 
           if (whisperResponse.ok) {
             const data = await whisperResponse.json();
-            return res.json({ text: data.text || '', engine: 'whisper' });
+            return data.text || '';
           } else {
-            console.warn("Whisper returned error, falling back to Gemini:", await whisperResponse.text());
+            console.warn("Whisper returned error, falling back:", whisperResponse.status);
           }
-        } catch (whisperErr) {
-          console.warn("Whisper execution failed, falling back to Gemini:", whisperErr);
+        } catch (whisperErr: any) {
+          console.warn("Whisper execution failed, falling back:", whisperErr?.message || whisperErr);
+        }
+        return null;
+      };
+
+      if (engine === 'whisper' && openAiKey) {
+        const whisperText = await tryOpenAiWhisper();
+        if (whisperText !== null) {
+          return res.json({ text: whisperText, engine: 'whisper' });
         }
       }
 
@@ -1107,16 +1162,19 @@ ${htmlContent}`;
       ];
 
       try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: transcriptionPrompt
+        response = await callGeminiWithFallback(ai, {
+          contents: transcriptionPrompt,
+          models: ['gemini-3.5-transcribe', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
         });
       } catch (err) {
-        console.warn("transcribe fallback to gemini-3.1-flash-lite:", err);
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: transcriptionPrompt
-        });
+        console.warn("transcribe fallback due to high demand:", err);
+        if (engine !== 'whisper' && openAiKey) {
+          const whisperText = await tryOpenAiWhisper();
+          if (whisperText !== null) {
+            return res.json({ text: whisperText, engine: 'whisper' });
+          }
+        }
+        return res.status(503).json({ error: "Serviço de transcrição temporariamente em alta demanda (503). Tente novamente em instantes." });
       }
 
       const transcript = (response.text || '').trim();
@@ -1180,16 +1238,17 @@ ${htmlContent}`;
       }
 
       // If audio modality is not available, fallback to OpenAI TTS if available
-      if (process.env.OPENAI_API_KEY) {
+      const openAiKey = getOpenAiApiKey();
+      if (openAiKey) {
         const openAiResp = await fetch("https://api.openai.com/v1/audio/speech", {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Authorization": `Bearer ${openAiKey}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
             model: "tts-1",
-            input: text,
+            input: String(text).trim().slice(0, 4096),
             voice: "alloy",
             response_format: "mp3"
           })
@@ -1198,7 +1257,7 @@ ${htmlContent}`;
         if (openAiResp.ok) {
           const buffer = Buffer.from(await openAiResp.arrayBuffer());
           res.set({
-            "Content-Type": "audio/mp3",
+            "Content-Type": "audio/mpeg",
             "Content-Length": buffer.length.toString()
           });
           return res.send(buffer);
@@ -1221,16 +1280,17 @@ ${htmlContent}`;
       }
 
       // Fallback to OpenAI natural voice if configured
-      if (process.env.OPENAI_API_KEY) {
+      const openAiKey = getOpenAiApiKey();
+      if (openAiKey) {
         const response = await fetch("https://api.openai.com/v1/audio/speech", {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Authorization": `Bearer ${openAiKey}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
             model: "tts-1",
-            input: text,
+            input: String(text).trim().slice(0, 4096),
             voice: "onyx",
             response_format: "mp3"
           })
@@ -1239,7 +1299,7 @@ ${htmlContent}`;
         if (response.ok) {
           const buffer = Buffer.from(await response.arrayBuffer());
           res.set({
-            "Content-Type": "audio/mp3",
+            "Content-Type": "audio/mpeg",
             "Content-Length": buffer.length.toString(),
           });
           return res.send(buffer);
@@ -1256,14 +1316,18 @@ ${htmlContent}`;
   // OpenAI TTS Endpoint
   app.post("/api/openai/tts", requireAuth, async (req, res) => {
     const { text, voiceName } = req.body;
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = getOpenAiApiKey();
 
-    if (!text) {
+    if (!text || typeof text !== "string" || !text.trim()) {
       return res.status(400).json({ error: "Texto é obrigatório" });
     }
     if (!apiKey) {
-      return res.status(401).json({ error: "OpenAI API Key não configurada no servidor" });
+      return res.status(401).json({ error: "OpenAI API Key não configurada no servidor (defina OPENAI_ENVIRONMENT_KEY ou OPENAI_API_KEY)" });
     }
+
+    const normalizedVoice = typeof voiceName === "string" && OPENAI_ALLOWED_VOICES.has(voiceName.trim().toLowerCase())
+      ? voiceName.trim().toLowerCase()
+      : "alloy";
 
     try {
       const response = await fetch("https://api.openai.com/v1/audio/speech", {
@@ -1274,8 +1338,8 @@ ${htmlContent}`;
         },
         body: JSON.stringify({
           model: "tts-1",
-          input: text,
-          voice: voiceName || "alloy",
+          input: text.trim().slice(0, 4096),
+          voice: normalizedVoice,
           response_format: "mp3"
         })
       });
@@ -1287,12 +1351,12 @@ ${htmlContent}`;
 
       const buffer = Buffer.from(await response.arrayBuffer());
       res.set({
-        "Content-Type": "audio/mp3",
+        "Content-Type": "audio/mpeg",
         "Content-Length": buffer.length.toString(),
       });
       res.send(buffer);
     } catch (error: any) {
-      console.error("OpenAI TTS Error:", error);
+      console.error("OpenAI TTS Error:", error?.message || "Unknown error");
       res.status(500).json({ error: error.message || "Falha ao gerar áudio OpenAI" });
     }
   });
@@ -1302,7 +1366,7 @@ ${htmlContent}`;
   // ==========================================
 
   // ElevenLabs Text-to-Speech Endpoint
-  app.post("/api/elevenlabs/tts", async (req: any, res) => {
+  app.post("/api/elevenlabs/tts", requireAuth, async (req: any, res) => {
     try {
       const { text, voiceId = "QeklSZR6uyDJECk01m3i", voiceSettings } = req.body;
       const apiKey = process.env.ELEVENLABS_API_KEY || process.env.ELEVENLAB_API_KEY;
@@ -1449,7 +1513,10 @@ ${htmlContent}`;
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -1461,9 +1528,23 @@ ${htmlContent}`;
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+
+  server.on("error", (err: any) => {
+    console.error("Express server error:", err);
   });
 }
 
-startServer();
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled Rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+});
+
+startServer().catch((err) => {
+  console.error("Failed to start server:", err);
+});

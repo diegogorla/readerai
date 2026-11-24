@@ -11,9 +11,28 @@ import { AddNoteModal } from './components/AddNoteModal';
 import { DirectTextInputModal } from './components/DirectTextInputModal';
 import { UrlInputModal } from './components/UrlInputModal';
 import { useSpeech } from './hooks/useSpeech';
-import { parseFile, translateContent, exportContent, fetchAndCleanUrl, generateNotes, checkUsageLimit } from './services/api';
-import type { Highlight, Comment, ExportFormat, OpenDocument } from './types';
-import { AuthProvider, useAuth } from './hooks/useAuth';
+import { parseFile, translateContent, exportContent, fetchAndCleanUrl, generateNotes } from './services/api';
+import type { Highlight, HighlightColor, Comment, ExportFormat, OpenDocument } from './types';
+import { useAuth } from './hooks/useAuth';
+import {
+  db,
+  OperationType,
+  handleFirestoreError,
+  buildFirestoreDocumentCreatePayload,
+  buildFirestoreDocumentUpdatePayload,
+  mapDocSnapToOpenDocument,
+  sanitizeId,
+} from './lib/firebase';
+import {
+  collection,
+  doc,
+  onSnapshot,
+  query,
+  where,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+} from 'firebase/firestore';
 import { SubscriptionModal } from './components/SubscriptionModal';
 import { AuthModal } from './components/AuthModal';
 import { SmartListPanel } from './components/SmartListPanel';
@@ -25,18 +44,61 @@ interface SelectionInfo {
   position: { top: number; left: number };
 }
 
+function escapeHtmlText(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
+function stripTtsWrappersFromNode(source: HTMLElement | DocumentFragment): string {
+  const wrapper = document.createElement('div');
+  wrapper.appendChild(source.cloneNode(true));
+
+  // Remove transient TTS highlight classes
+  wrapper.querySelectorAll('.tts-active-sentence, .tts-active-sentence-word, .tts-current-word').forEach(el => {
+    el.classList.remove('tts-active-sentence', 'tts-active-sentence-word', 'tts-current-word');
+  });
+
+  // Unwrap .tts-word and .tts-sentence spans while keeping semantic tags & <mark class="doc-highlight">
+  const unwrapSelector = 'span.tts-word, span.tts-sentence';
+  let span = wrapper.querySelector(unwrapSelector);
+  while (span) {
+    const parent = span.parentNode;
+    if (!parent) break;
+    while (span.firstChild) {
+      parent.insertBefore(span.firstChild, span);
+    }
+    parent.removeChild(span);
+    span = wrapper.querySelector(unwrapSelector);
+  }
+
+  // Remove tts-sentence class if added onto a block element
+  wrapper.querySelectorAll('.tts-sentence').forEach(el => el.classList.remove('tts-sentence'));
+  wrapper.normalize();
+  return wrapper.innerHTML;
+}
 
 function App() {
-  const { user, userData, loading } = useAuth();
+  const { user, userData, loading, authReady, isPro, checkAndIncrementUsage } = useAuth();
 
-
-  const MAX_DOCUMENTS = userData?.plan === 'pro' ? 3 : 1;
+  const MAX_DOCUMENTS = isPro ? 3 : 1;
   const [documents, setDocuments] = useState<OpenDocument[]>([]);
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   
   const [zoom, setZoom] = useState(100);
   const [isHighlightMode, setIsHighlightMode] = useState(false);
+  const [highlightColor, setHighlightColor] = useState<HighlightColor>(() => {
+    try {
+      const saved = typeof window !== 'undefined' ? localStorage.getItem('readerai_highlight_color') : null;
+      if (saved && ['yellow', 'green', 'blue', 'pink', 'purple', 'orange'].includes(saved)) {
+        return saved as HighlightColor;
+      }
+    } catch {}
+    return 'yellow';
+  });
   const [selectionActive, setSelectionActive] = useState(false);
   const [selectionInfo, setSelectionInfo] = useState<SelectionInfo | null>(null);
   const [limitWarning, setLimitWarning] = useState<string | null>(null);
@@ -66,6 +128,7 @@ function App() {
   };
   
   const activeContentRef = useRef<HTMLDivElement | null>(null);
+  const inactiveContentRef = useRef<HTMLDivElement | null>(null);
 
   // Active document helper
   const activeDocument = documents.find(d => d.id === activeDocumentId) || (documents.length > 0 ? documents[0] : null);
@@ -85,35 +148,96 @@ function App() {
     handleNextSentence, 
     handlePreviousSentence,
     speakStandalone
-  } = useSpeech(activeContentRef, activeDocument?.content || '');
+  } = useSpeech(
+    activeContentRef,
+    activeDocument?.content || '',
+    activeDocument?.id || null,
+    Boolean(activeDocument && !activeDocument.isMinimized)
+  );
+
+  // Real-time Firestore persistence for user's open documents
+  useEffect(() => {
+    if (!authReady || !user) {
+      setDocuments([]);
+      setActiveDocumentId(null);
+      return;
+    }
+
+    const docsPath = `users/${user.uid}/documents`;
+    const docsQuery = query(
+      collection(db, 'users', user.uid, 'documents'),
+      where('ownerId', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(
+      docsQuery,
+      (snapshot) => {
+        const loadedDocs = snapshot.docs
+          .map((d) => mapDocSnapToOpenDocument(d.id, d.data()))
+          .sort((a, b) => a.createdAt - b.createdAt);
+        setDocuments(loadedDocs);
+        setActiveDocumentId((prev) => {
+          if (prev && loadedDocs.some((d) => d.id === prev)) return prev;
+          return loadedDocs.length > 0 ? loadedDocs[0].id : null;
+        });
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, docsPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [authReady, user]);
+
+  const persistDocumentPatch = useCallback(
+    async (docId: string, patch: Partial<OpenDocument>) => {
+      if (!user) return;
+      const docPath = `users/${user.uid}/documents/${docId}`;
+      try {
+        await updateDoc(
+          doc(db, 'users', user.uid, 'documents', docId),
+          buildFirestoreDocumentUpdatePayload(patch)
+        );
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, docPath);
+      }
+    },
+    [user]
+  );
 
   // Helper to show limit warning
-  const showLimitNotice = () => {
-    setLimitWarning(`Limite de ${MAX_DOCUMENTS} documentos simultâneos atingido. Feche um dos documentos abertos para adicionar outro.`);
+  const showLimitNotice = useCallback(() => {
+    const msg = isPro
+      ? `Limite de ${MAX_DOCUMENTS} documentos simultâneos atingido. Feche um dos documentos abertos para adicionar outro.`
+      : `O Plano Gratuito permite 1 documento aberto por vez. Feche o atual ou assine o Plano Pro para até 3 documentos simultâneos.`;
+    setLimitWarning(msg);
+    if (!isPro) {
+      handleOpenSubscription(msg);
+    }
     setTimeout(() => {
       setLimitWarning(null);
     }, 5000);
-  };
+  }, [isPro, MAX_DOCUMENTS]);
 
-  // Add document to list (up to 3)
-  const addDocument = useCallback((doc: Omit<OpenDocument, 'id' | 'createdAt' | 'isMinimized' | 'highlights' | 'comments'> & { highlights?: Highlight[]; comments?: Comment[] }) => {
+  // Add document to list and persist to Firestore
+  const addDocument = useCallback((docInput: Omit<OpenDocument, 'id' | 'createdAt' | 'isMinimized' | 'highlights' | 'comments'> & { highlights?: Highlight[]; comments?: Comment[] }) => {
     if (documents.length >= MAX_DOCUMENTS) {
       showLimitNotice();
       return false;
     }
 
-    const newDocId = `doc-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+    const newDocId = sanitizeId(`doc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
     const newDoc: OpenDocument = {
       id: newDocId,
-      title: doc.title || doc.filename,
-      filename: doc.filename,
-      content: doc.content,
-      originalContent: doc.originalContent || doc.content,
-      contentType: doc.contentType || 'html',
-      sourceUrl: doc.sourceUrl,
-      type: doc.type || 'file',
-      highlights: doc.highlights || [],
-      comments: doc.comments || [],
+      title: docInput.title || docInput.filename,
+      filename: docInput.filename,
+      content: docInput.content,
+      originalContent: docInput.originalContent || docInput.content,
+      contentType: docInput.contentType || 'html',
+      sourceUrl: docInput.sourceUrl,
+      type: docInput.type || 'file',
+      highlights: docInput.highlights || [],
+      comments: docInput.comments || [],
       isMinimized: false,
       createdAt: Date.now(),
     };
@@ -122,11 +246,25 @@ function App() {
     setActiveDocumentId(newDocId);
     setSelectionInfo(null);
     setSelectionActive(false);
+
+    if (user) {
+      const docPath = `users/${user.uid}/documents/${newDocId}`;
+      setDoc(
+        doc(db, 'users', user.uid, 'documents', newDocId),
+        buildFirestoreDocumentCreatePayload(user.uid, newDoc)
+      ).catch((error) => {
+        handleFirestoreError(error, OperationType.CREATE, docPath);
+      });
+    }
     return true;
-  }, [documents.length]);
+  }, [documents.length, MAX_DOCUMENTS, showLimitNotice, user]);
 
   const handleFileUpload = useCallback(async (file: File) => {
-    try { await checkUsageLimit('file'); } catch (e: any) { setLimitWarning(e.message); return; }
+    const usageResult = await checkAndIncrementUsage('file');
+    if (!usageResult.allowed) {
+      handleOpenSubscription(usageResult.message);
+      return;
+    }
     if (documents.length >= MAX_DOCUMENTS) {
       showLimitNotice();
       return;
@@ -150,10 +288,14 @@ function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [documents.length, handleStop, addDocument]);
+  }, [checkAndIncrementUsage, documents.length, MAX_DOCUMENTS, showLimitNotice, handleStop, addDocument]);
 
   const handleUrlSubmit = useCallback(async (url: string) => {
-    try { await checkUsageLimit('url'); } catch (e: any) { setLimitWarning(e.message); return; }
+    const usageResult = await checkAndIncrementUsage('url');
+    if (!usageResult.allowed) {
+      handleOpenSubscription(usageResult.message);
+      return;
+    }
     if (documents.length >= MAX_DOCUMENTS) {
       showLimitNotice();
       return;
@@ -183,30 +325,48 @@ function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [documents.length, handleStop, addDocument]);
+  }, [checkAndIncrementUsage, documents.length, MAX_DOCUMENTS, showLimitNotice, handleStop, addDocument]);
 
-  const handleDirectTextSubmit = useCallback(async (title: string, text: string) => {
-    try { await checkUsageLimit('text'); } catch (e: any) { alert(e.message); return; }
+  const showNotice = useCallback((message: string) => {
+    setLimitWarning(message);
+    setTimeout(() => {
+      setLimitWarning(prev => (prev === message ? null : prev));
+    }, 5500);
+  }, []);
+
+  const handleDirectTextSubmit = useCallback(async (text: string, title?: string) => {
+    const cleanText = (text || '').trim();
+    if (!cleanText) return;
+
+    const usageResult = await checkAndIncrementUsage('text');
+    if (!usageResult.allowed) {
+      handleOpenSubscription(usageResult.message);
+      return;
+    }
     if (documents.length >= MAX_DOCUMENTS) {
       showLimitNotice();
       return;
     }
     handleStop();
-    // Convert newlines to HTML paragraphs for rich display and TTS segmentation
-    const formattedHtml = text
-      .split('\n\n')
-      .map(paragraph => `<p>${paragraph.replace(/\n/g, '<br/>')}</p>`)
+
+    // Convert plain text paragraphs safely to clean HTML for rich display and TTS segmentation
+    const formattedHtml = cleanText
+      .split(/\n{2,}/)
+      .map(paragraph => `<p>${escapeHtmlText(paragraph.trim()).replace(/\n/g, '<br/>')}</p>`)
+      .filter(p => p !== '<p></p>')
       .join('');
 
+    const docTitle = (title || '').trim() || 'Texto Digitado';
+
     addDocument({
-      title: title || 'Texto Digitado',
-      filename: title || 'Texto Digitado',
-      content: formattedHtml,
-      originalContent: formattedHtml,
+      title: docTitle,
+      filename: docTitle,
+      content: formattedHtml || `<p>${escapeHtmlText(cleanText)}</p>`,
+      originalContent: formattedHtml || `<p>${escapeHtmlText(cleanText)}</p>`,
       contentType: 'html',
       type: 'direct_text',
     });
-  }, [documents.length, handleStop, addDocument]);
+  }, [checkAndIncrementUsage, documents.length, MAX_DOCUMENTS, showLimitNotice, handleStop, addDocument]);
 
   const handleCloseDocument = useCallback((docId: string) => {
     handleStop();
@@ -219,16 +379,25 @@ function App() {
     });
     setSelectionInfo(null);
     setSelectionActive(false);
-  }, [activeDocumentId, handleStop]);
+
+    if (user) {
+      const docPath = `users/${user.uid}/documents/${docId}`;
+      deleteDoc(doc(db, 'users', user.uid, 'documents', docId)).catch((error) => {
+        handleFirestoreError(error, OperationType.DELETE, docPath);
+      });
+    }
+  }, [activeDocumentId, handleStop, user]);
 
   const handleToggleMinimize = useCallback((docId: string) => {
-    setDocuments(prev => prev.map(doc => {
-      if (doc.id === docId) {
-        return { ...doc, isMinimized: !doc.isMinimized };
+    setDocuments(prev => prev.map(d => {
+      if (d.id === docId) {
+        const nextMinimized = !d.isMinimized;
+        persistDocumentPatch(docId, { isMinimized: nextMinimized });
+        return { ...d, isMinimized: nextMinimized };
       }
-      return doc;
+      return d;
     }));
-  }, []);
+  }, [persistDocumentPatch]);
 
   const handleFocusDocument = useCallback((docId: string) => {
     setActiveDocumentId(docId);
@@ -271,16 +440,25 @@ function App() {
     setSelectionInfo(info || null);
   }, [activeDocumentId]);
   
-  const applyHighlightToRange = useCallback((docId: string, range: Range, text: string, existingId?: string) => {
+  const applyHighlightToRange = useCallback((
+    docId: string,
+    range: Range,
+    text: string,
+    existingId?: string,
+    colorOverride?: HighlightColor
+  ) => {
     const id = existingId || `highlight-${Date.now()}`;
+    const color = colorOverride || highlightColor;
+    const markClass = `doc-highlight doc-highlight-${color}`;
     const container = activeContentRef.current;
     if (!range || !container) return id;
 
     try {
       if (range.startContainer === range.endContainer && range.startContainer.nodeType === Node.TEXT_NODE) {
         const mark = document.createElement('mark');
-        mark.className = 'doc-highlight';
+        mark.className = markClass;
         mark.setAttribute('data-highlight-id', id);
+        mark.setAttribute('data-highlight-color', color);
         mark.id = id;
         try {
           range.surroundContents(mark);
@@ -291,8 +469,9 @@ function App() {
         }
       } else {
         const mark = document.createElement('mark');
-        mark.className = 'doc-highlight';
+        mark.className = markClass;
         mark.setAttribute('data-highlight-id', id);
+        mark.setAttribute('data-highlight-color', color);
         mark.id = id;
         try {
           const contents = range.extractContents();
@@ -308,8 +487,9 @@ function App() {
             if (range.compareBoundaryPoints(Range.START_TO_END, nodeRange) > 0 &&
                 range.compareBoundaryPoints(Range.END_TO_START, nodeRange) < 0) {
               const subMark = document.createElement('mark');
-              subMark.className = 'doc-highlight';
+              subMark.className = markClass;
               subMark.setAttribute('data-highlight-id', id);
+              subMark.setAttribute('data-highlight-color', color);
               const subRange = document.createRange();
               const startOffset = (currNode === range.startContainer) ? range.startOffset : 0;
               const endOffset = (currNode === range.endContainer) ? range.endOffset : (currNode.nodeValue?.length || 0);
@@ -325,25 +505,27 @@ function App() {
         }
       }
 
-      // Persist the modified HTML into the document's content state
-      const updatedHtml = container.innerHTML;
-      setDocuments(prev => prev.map(doc => {
-        if (doc.id === docId) {
+      // Persist clean HTML (without transient TTS wrappers) into document state & Firestore
+      const updatedHtml = stripTtsWrappersFromNode(container);
+      setDocuments(prev => prev.map(d => {
+        if (d.id === docId) {
+          const nextHighlights = [...d.highlights, { id, text, color }];
+          persistDocumentPatch(docId, { content: updatedHtml, highlights: nextHighlights });
           return {
-            ...doc,
+            ...d,
             content: updatedHtml,
-            highlights: [...doc.highlights, { id, text }]
+            highlights: nextHighlights
           };
         }
-        return doc;
+        return d;
       }));
     } catch (err) {
       console.warn("Could not apply highlight:", err);
     }
     return id;
-  }, []);
+  }, [highlightColor, persistDocumentPatch]);
 
-  const handleHighlightText = useCallback((docId: string, customRange?: Range, customText?: string) => {
+  const handleHighlightText = useCallback((docId: string, customRange?: Range, customText?: string, colorOverride?: HighlightColor) => {
     let targetRange = customRange || selectionInfo?.range;
     let targetText = customText || selectionInfo?.text;
 
@@ -356,7 +538,7 @@ function App() {
     }
 
     if (targetRange && targetText) {
-      applyHighlightToRange(docId, targetRange, targetText);
+      applyHighlightToRange(docId, targetRange, targetText, undefined, colorOverride);
       const sel = window.getSelection();
       if (sel) {
         sel.removeAllRanges();
@@ -369,6 +551,18 @@ function App() {
   const handleToggleHighlightMode = () => {
     setIsHighlightMode(prev => !prev);
   };
+
+  const handleSetHighlightColor = useCallback((color: HighlightColor) => {
+    setHighlightColor(color);
+    try {
+      localStorage.setItem('readerai_highlight_color', color);
+    } catch {}
+
+    // If user currently has text selected in the active document, apply the chosen color right away
+    if (activeDocument && (selectionActive || (window.getSelection() && !window.getSelection()?.isCollapsed))) {
+      handleHighlightText(activeDocument.id, undefined, undefined, color);
+    }
+  }, [activeDocument, selectionActive, handleHighlightText]);
 
   const handleUndoHighlight = useCallback(() => {
     if (!activeDocumentId) return;
@@ -404,16 +598,18 @@ function App() {
             parent.removeChild(el);
           }
         });
-        updatedContent = activeContentRef.current.innerHTML;
+        updatedContent = stripTtsWrappersFromNode(activeContentRef.current);
       }
 
+      const nextHighlights = doc.highlights.filter(h => h.id !== highlightToRemove.id);
+      persistDocumentPatch(doc.id, { content: updatedContent, highlights: nextHighlights });
       return {
         ...doc,
         content: updatedContent,
-        highlights: doc.highlights.filter(h => h.id !== highlightToRemove.id)
+        highlights: nextHighlights
       };
     }));
-  }, [activeDocumentId]);
+  }, [activeDocumentId, persistDocumentPatch]);
 
   const handleComment = useCallback((docId?: string, targetSelection?: SelectionInfo | null) => {
     const targetId = docId || activeDocumentId;
@@ -456,41 +652,44 @@ function App() {
       updatedAt: Date.now(),
     };
 
-    setDocuments(prev => prev.map(doc => {
-      if (doc.id === targetId) {
+    setDocuments(prev => prev.map(d => {
+      if (d.id === targetId) {
+        const nextComments = [...d.comments, newComment];
+        persistDocumentPatch(targetId, { comments: nextComments });
         return {
-          ...doc,
-          comments: [...doc.comments, newComment]
+          ...d,
+          comments: nextComments
         };
       }
-      return doc;
+      return d;
     }));
     setIsSidebarOpen(true);
   };
 
   const handleEditComment = useCallback((commentId: string, newText: string) => {
-    setDocuments(prev => prev.map(doc => {
-      const commentIndex = doc.comments.findIndex(c => c.id === commentId);
+    setDocuments(prev => prev.map(d => {
+      const commentIndex = d.comments.findIndex(c => c.id === commentId);
       if (commentIndex !== -1) {
-        const updatedComments = [...doc.comments];
+        const updatedComments = [...d.comments];
         updatedComments[commentIndex] = {
           ...updatedComments[commentIndex],
           text: newText,
           updatedAt: Date.now(),
         };
-        return { ...doc, comments: updatedComments };
+        persistDocumentPatch(d.id, { comments: updatedComments });
+        return { ...d, comments: updatedComments };
       }
-      return doc;
+      return d;
     }));
-  }, []);
+  }, [persistDocumentPatch]);
 
   const handleDeleteComment = (commentId: string) => {
-    setDocuments(prev => prev.map(doc => {
-      const commentToDelete = doc.comments.find(c => c.id === commentId);
-      if (!commentToDelete) return doc;
+    setDocuments(prev => prev.map(d => {
+      const commentToDelete = d.comments.find(c => c.id === commentId);
+      if (!commentToDelete) return d;
 
-      let updatedContent = doc.content;
-      if (activeContentRef.current && commentToDelete.highlightId && doc.id === activeDocumentId) {
+      let updatedContent = d.content;
+      if (activeContentRef.current && commentToDelete.highlightId && d.id === activeDocumentId) {
         const elements = activeContentRef.current.querySelectorAll(`[data-highlight-id="${commentToDelete.highlightId}"]`);
         elements.forEach(el => {
           const parent = el.parentNode;
@@ -501,14 +700,18 @@ function App() {
             parent.removeChild(el);
           }
         });
-        updatedContent = activeContentRef.current.innerHTML;
+        updatedContent = stripTtsWrappersFromNode(activeContentRef.current);
       }
 
+      const nextComments = d.comments.filter(c => c.id !== commentId);
+      const nextHighlights = d.highlights.filter(h => h.id !== commentToDelete.highlightId);
+      persistDocumentPatch(d.id, { content: updatedContent, comments: nextComments, highlights: nextHighlights });
+
       return {
-        ...doc,
+        ...d,
         content: updatedContent,
-        comments: doc.comments.filter(c => c.id !== commentId),
-        highlights: doc.highlights.filter(h => h.id !== commentToDelete.highlightId),
+        comments: nextComments,
+        highlights: nextHighlights,
       };
     }));
   };
@@ -517,42 +720,137 @@ function App() {
     if (docId !== activeDocumentId) {
       setActiveDocumentId(docId);
     }
-    handlePlayFromNode(targetNode, selectedText);
+    handlePlayFromNode(targetNode, selectedText, selectionInfo?.range || null);
     setSelectionInfo(null);
     setSelectionActive(false);
-  }, [activeDocumentId, handlePlayFromNode]);
+  }, [activeDocumentId, handlePlayFromNode, selectionInfo]);
+
+  const handleHeaderPlay = useCallback(() => {
+    const hadSelection = Boolean(selectionInfo?.text) || Boolean(window.getSelection() && !window.getSelection()?.isCollapsed);
+    handlePlay(selectionInfo);
+    if (hadSelection) {
+      setSelectionInfo(null);
+      setSelectionActive(false);
+    }
+  }, [handlePlay, selectionInfo]);
 
   const handlePlayDocument = useCallback((docId: string) => {
-    if (docId !== activeDocumentId) {
+    const targetDoc = documents.find(d => d.id === docId);
+    const needsSwitch = docId !== activeDocumentId;
+    const needsExpand = Boolean(targetDoc?.isMinimized);
+
+    if (needsExpand) {
+      setDocuments(prev => prev.map(d => {
+        if (d.id === docId) {
+          persistDocumentPatch(docId, { isMinimized: false });
+          return { ...d, isMinimized: false };
+        }
+        return d;
+      }));
+    }
+
+    if (needsSwitch) {
+      handleStop();
       setActiveDocumentId(docId);
     }
-    // Start playback
-    handlePlay();
-  }, [activeDocumentId, handlePlay]);
+
+    if (needsSwitch || needsExpand) {
+      // Wait for React to commit the activeContentRef to the target DocumentPanel before playing
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          handlePlay(null);
+        });
+      });
+    } else {
+      handleHeaderPlay();
+    }
+  }, [documents, activeDocumentId, persistDocumentPatch, handleStop, handlePlay, handleHeaderPlay]);
+
+  // Helper to get active selection range & clean HTML inside activeContentRef
+  const getActiveSelectionRange = useCallback((): { range: Range; text: string } | null => {
+    const container = activeContentRef.current;
+    if (!container) return null;
+
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+      const r = sel.getRangeAt(0);
+      const t = sel.toString().trim();
+      if (t && container.contains(r.commonAncestorContainer)) {
+        return { range: r.cloneRange(), text: t };
+      }
+    }
+
+    if (selectionInfo?.range && selectionInfo.text.trim() && container.contains(selectionInfo.range.commonAncestorContainer)) {
+      return { range: selectionInfo.range.cloneRange(), text: selectionInfo.text.trim() };
+    }
+
+    return null;
+  }, [selectionInfo]);
 
   const handleTranslate = async (targetLanguage: string = 'pt-BR') => {
     if (!activeDocument) {
-      alert("Abra ou envie um documento antes de traduzir.");
+      showNotice("Abra ou envie um documento antes de traduzir.");
       return;
     }
-    const textToTranslate = activeDocument.content || activeDocument.originalContent;
-    if (!textToTranslate) return;
+
+    const activeSelection = getActiveSelectionRange();
+    const container = activeContentRef.current;
 
     setIsLoading(true);
     handleStop();
     try {
-      const translated = await translateContent(textToTranslate, targetLanguage);
-      if (translated) {
-        setDocuments(prev => prev.map(doc => {
-          if (doc.id === activeDocument.id) {
-            return { ...doc, content: translated, originalContent: translated };
-          }
-          return doc;
-        }));
+      if (activeSelection && container) {
+        // Translate ONLY the selected excerpt
+        const rawSelectedText = activeSelection.range.toString();
+        const leadingSpace = rawSelectedText.match(/^\s+/)?.[0] || '';
+        const trailingSpace = rawSelectedText.match(/\s+$/)?.[0] || '';
+
+        const clonedFragment = activeSelection.range.cloneContents();
+        const cleanSelectionHtml = stripTtsWrappersFromNode(clonedFragment).trim() || activeSelection.text;
+        const translated = await translateContent(cleanSelectionHtml, targetLanguage, true);
+
+        if (translated) {
+          const finalTranslated = `${leadingSpace}${translated.trim()}${trailingSpace}`;
+          const liveRange = activeSelection.range;
+          liveRange.deleteContents();
+          const newFragment = liveRange.createContextualFragment(finalTranslated);
+          liveRange.insertNode(newFragment);
+
+          const updatedDocHtml = stripTtsWrappersFromNode(container);
+          persistDocumentPatch(activeDocument.id, { content: updatedDocHtml });
+          setDocuments(prev => prev.map(d => {
+            if (d.id === activeDocument.id) {
+              return { ...d, content: updatedDocHtml };
+            }
+            return d;
+          }));
+
+          const sel = window.getSelection();
+          if (sel) sel.removeAllRanges();
+          setSelectionInfo(null);
+          setSelectionActive(false);
+        }
+      } else {
+        // Translate the entire document
+        const cleanFullHtml = container
+          ? stripTtsWrappersFromNode(container)
+          : (activeDocument.content || activeDocument.originalContent);
+        if (!cleanFullHtml) return;
+
+        const translated = await translateContent(cleanFullHtml, targetLanguage, false);
+        if (translated) {
+          persistDocumentPatch(activeDocument.id, { content: translated });
+          setDocuments(prev => prev.map(d => {
+            if (d.id === activeDocument.id) {
+              return { ...d, content: translated, originalContent: translated };
+            }
+            return d;
+          }));
+        }
       }
     } catch (error: any) {
       console.error("Translation error:", error);
-      alert(error.message || "Falha ao traduzir o conteúdo.");
+      showNotice(error.message || "Falha ao traduzir o conteúdo.");
     } finally {
       setIsLoading(false);
     }
@@ -560,15 +858,35 @@ function App() {
 
   const handleGenerateNotes = async () => {
     if (!activeDocument) {
-      alert("Abra ou envie um documento primeiro.");
+      showNotice("Abra ou envie um documento primeiro.");
       return;
     }
-    const textForNotes = activeDocument.content || activeDocument.originalContent;
-    if (!textForNotes) return;
+
+    const activeSelection = getActiveSelectionRange();
+    const container = activeContentRef.current;
+
+    const isSelection = Boolean(activeSelection);
+    let textForNotes = '';
+    if (activeSelection) {
+      textForNotes = stripTtsWrappersFromNode(activeSelection.range.cloneContents()).trim() || activeSelection.text;
+    } else {
+      textForNotes = container
+        ? stripTtsWrappersFromNode(container)
+        : (activeDocument.content || activeDocument.originalContent);
+    }
+
+    if (!textForNotes.trim()) {
+      showNotice("O documento está vazio.");
+      return;
+    }
 
     setIsLoading(true);
     try {
-      const notes = await generateNotes(textForNotes);
+      const notes = await generateNotes(textForNotes, isSelection);
+      if (!notes.trim()) {
+        showNotice("Não foi possível gerar notas para este conteúdo.");
+        return;
+      }
       const notesId = `notes-${Date.now()}`;
       const newComment: Comment = {
         id: notesId,
@@ -577,16 +895,18 @@ function App() {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
-      setDocuments(prev => prev.map(doc => {
-        if (doc.id === activeDocument.id) {
-          return { ...doc, comments: [...doc.comments, newComment] };
+      setDocuments(prev => prev.map(d => {
+        if (d.id === activeDocument.id) {
+          const nextComments = [...d.comments, newComment];
+          persistDocumentPatch(activeDocument.id, { comments: nextComments });
+          return { ...d, comments: nextComments };
         }
-        return doc;
+        return d;
       }));
       setIsSidebarOpen(true);
     } catch (error: any) {
       console.error("Notes generation error:", error);
-      alert(error.message || "Falha ao gerar notas.");
+      showNotice(error.message || "Falha ao gerar notas com IA.");
     } finally {
       setIsLoading(false);
     }
@@ -601,7 +921,7 @@ function App() {
       await exportContent(activeContentRef.current, format, activeDocument.title, commentsText);
     } catch (error) {
       console.error("Export error:", error);
-      alert("Falha ao exportar documento.");
+      showNotice("Falha ao exportar documento.");
     }
   };
 
@@ -654,6 +974,8 @@ function App() {
             handleHighlightText(activeDocument.id);
           }
         }}
+        highlightColor={highlightColor}
+        onSetHighlightColor={handleSetHighlightColor}
         onComment={() => {
           if (activeDocument) {
             handleComment(activeDocument.id);
@@ -676,7 +998,7 @@ function App() {
         recognitionState={recognitionState}
         onSetVoice={handleSetVoice}
         onSetRate={handleSetRate}
-        onPlay={handlePlay}
+        onPlay={handleHeaderPlay}
         onPause={handlePause}
         onStop={handleStop}
         onToggleListen={toggleListening}
@@ -758,7 +1080,7 @@ function App() {
                     onAddNoteFromSelection={handleComment}
                     onPlayFromSelection={handlePlayFromSelection}
                     onPlayDocument={handlePlayDocument}
-                    contentRef={isDocActive ? activeContentRef : { current: null }}
+                    contentRef={isDocActive ? activeContentRef : inactiveContentRef}
                     selectionInfo={isDocActive ? selectionInfo : null}
                   />
                 );
@@ -924,6 +1246,10 @@ function App() {
         onClose={() => setIsVoiceGalleryOpen(false)}
         voices={ttsState.voices}
         selectedVoice={ttsState.selectedVoice}
+        onUpgrade={() => {
+          setIsVoiceGalleryOpen(false);
+          handleOpenSubscription('Vozes neurais de IA (ElevenLabs, Gemini, Antonio e OpenAI) são exclusivas do Plano Pro.');
+        }}
         onSelectVoice={(voice) => {
           handleStop();
           handleSetVoice(voice);

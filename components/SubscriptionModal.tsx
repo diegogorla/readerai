@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
-import { X, Check, CreditCard, Sparkles, Globe, Shield, Bell, Mic, Volume2, Flame, Layers, ExternalLink } from 'lucide-react';
+import {
+  X, Check, CreditCard, Sparkles, Globe, Shield, Bell, Mic, Volume2,
+  Flame, Layers, ExternalLink, AlertCircle, CheckCircle2, ShieldAlert
+} from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
-import { fetchWithAuth } from '../lib/authHelper';
 import { openPaddleCheckout, openPaddleCustomerPortal, PADDLE_PRICES } from '../services/paddle';
 
 interface SubscriptionModalProps {
@@ -11,11 +13,12 @@ interface SubscriptionModalProps {
 }
 
 export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, onClose, triggerReason }) => {
-  const { user, userData } = useAuth();
+  const { user, userData, isPro, isAdmin, trialDaysRemaining, adminSetPlanPreview } = useAuth();
   const [loading, setLoading] = useState(false);
   const [currency, setCurrency] = useState<'BRL' | 'USD'>('BRL');
   const [planType, setPlanType] = useState<'monthly' | 'annual' | 'lifetime'>('annual');
-  const [paymentProvider, setPaymentProvider] = useState<'paddle' | 'revenuecat' | 'googlepay'>('paddle');
+  const [paymentProvider, setPaymentProvider] = useState<'paddle' | 'revenuecat'>('paddle');
+  const [statusMessage, setStatusMessage] = useState<{ type: 'error' | 'info' | 'success'; text: string } | null>(null);
 
   if (!isOpen) return null;
 
@@ -33,60 +36,82 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
   };
 
   const handleSubscribe = async () => {
+    setStatusMessage(null);
     if (!user) {
-      alert("Por favor, faça login ou autentique com o código 2FA antes de assinar.");
+      setStatusMessage({
+        type: 'error',
+        text: 'Faça login com sua conta Google antes de iniciar a assinatura.',
+      });
       return;
     }
+
+    if (paymentProvider === 'revenuecat') {
+      setStatusMessage({
+        type: 'info',
+        text: 'RevenueCat processa assinaturas nativas dentro dos aplicativos iOS (App Store) e Android (Google Play). Na web, utilize o checkout seguro via Paddle (que aceita cartão, Apple Pay e Google Pay).',
+      });
+      return;
+    }
+
+    const clientToken = (import.meta as any).env?.VITE_PADDLE_CLIENT_TOKEN;
+    if (!clientToken || clientToken === 'test_token_readerai') {
+      setStatusMessage({
+        type: 'info',
+        text: 'Checkout Paddle pronto para ativação! Configure suas chaves reais do Paddle (VITE_PADDLE_CLIENT_TOKEN, PADDLE_API_KEY e PADDLE_WEBHOOK_SECRET_KEY) nas variáveis de ambiente para processar cobranças reais e liberar o Plano Pro automaticamente via webhook.',
+      });
+      return;
+    }
+
     setLoading(true);
     try {
-      if (paymentProvider === 'paddle') {
-        const paddlePrice = PADDLE_PRICES[currency][planType];
-        await openPaddleCheckout({
-          priceId: paddlePrice.id,
-          planType,
-          currency,
-          userEmail: user.email,
-          userId: user.uid,
-          onSuccess: async () => {
-            await fetchWithAuth('/api/checkout', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                planType,
-                currency,
-                provider: 'paddle'
-              })
-            });
-            alert("🎉 Parabéns! Sua assinatura foi ativada com sucesso via Paddle!\nVocê agora tem acesso ilimitado a vozes naturais, ditado por voz, alarmes e itens infinitos.");
-            onClose();
-          },
-          onError: (err) => {
-            alert("Erro ao abrir checkout Paddle: " + (err?.message || err));
-          }
-        });
-        return;
-      }
-
-      const response = await fetchWithAuth('/api/checkout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          planType,
-          currency,
-          provider: paymentProvider
-        })
+      const paddlePrice = PADDLE_PRICES[currency][planType];
+      await openPaddleCheckout({
+        priceId: paddlePrice.id,
+        planType,
+        currency,
+        userEmail: user.email || undefined,
+        userId: user.uid,
+        onSuccess: async () => {
+          setStatusMessage({
+            type: 'success',
+            text: 'Pagamento recebido pelo Paddle! Sua assinatura Pro será sincronizada automaticamente assim que o webhook confirmar a transação.',
+          });
+        },
+        onError: (err) => {
+          setStatusMessage({
+            type: 'error',
+            text: 'Erro ao abrir checkout Paddle: ' + (err?.message || String(err)),
+          });
+        }
       });
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Erro ao processar assinatura');
-      }
-
-      alert("🎉 Parabéns! Sua assinatura foi ativada com sucesso!\nVocê agora tem acesso ilimitado a vozes naturais, ditado por voz, alarmes e itens infinitos.");
-      onClose();
     } catch (error: any) {
-      console.error("Error subscribing:", error);
-      alert(error.message || "Erro ao processar ativação do plano.");
+      console.error('Error subscribing:', error);
+      setStatusMessage({
+        type: 'error',
+        text: error?.message || 'Erro ao iniciar checkout.',
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdminToggle = async () => {
+    setLoading(true);
+    setStatusMessage(null);
+    try {
+      const nextPlan = isPro ? 'free' : 'pro';
+      await adminSetPlanPreview(nextPlan);
+      setStatusMessage({
+        type: 'success',
+        text: nextPlan === 'free'
+          ? 'Modo de teste alterado para Plano Gratuito (para validar limites).'
+          : 'Modo Administrador restaurado para Plano Pro.',
+      });
+    } catch (err: any) {
+      setStatusMessage({
+        type: 'error',
+        text: err?.message || 'Falha ao alternar plano de teste.',
+      });
     } finally {
       setLoading(false);
     }
@@ -95,10 +120,10 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center p-3 sm:p-4 bg-black/75 backdrop-blur-md animate-in fade-in duration-200 overflow-y-auto">
       <div className="bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl w-full max-w-4xl overflow-hidden flex flex-col md:flex-row relative my-auto border border-zinc-200 dark:border-zinc-800">
-        
-        <button 
+        <button
           onClick={onClose}
           className="absolute top-4 right-4 p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors z-20"
+          aria-label="Fechar"
         >
           <X size={20} />
         </button>
@@ -123,8 +148,12 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
 
           <ul className="space-y-3 mb-8 flex-1 text-xs text-zinc-700 dark:text-zinc-300">
             <li className="flex items-center gap-2.5">
+              <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-zinc-800 text-zinc-500 flex items-center justify-center text-[10px] font-bold">1</span>
+              <span><strong>1 documento aberto</strong> por vez (até 2 leituras por fonte)</span>
+            </li>
+            <li className="flex items-center gap-2.5">
               <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-zinc-800 text-zinc-500 flex items-center justify-center text-[10px] font-bold">5</span>
-              <span><strong>Máximo 5 itens ativos</strong> na lista</span>
+              <span><strong>Máximo 5 itens ativos</strong> na Lista Inteligente</span>
             </li>
             <li className="flex items-center gap-2.5">
               <Layers size={16} className="text-zinc-400 shrink-0" />
@@ -132,30 +161,51 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
             </li>
             <li className="flex items-center gap-2.5 text-zinc-400 dark:text-zinc-500 line-through">
               <Bell size={16} className="shrink-0" />
-              <span>Alarmes e avisos com notificação sonoro</span>
+              <span>Alarmes e avisos com notificação sonora</span>
             </li>
             <li className="flex items-center gap-2.5 text-zinc-400 dark:text-zinc-500 line-through">
               <Volume2 size={16} className="shrink-0" />
-              <span>Vozes naturais de IA (Gemini, Antonio e OpenAI)</span>
+              <span>Vozes naturais de IA (ElevenLabs, Gemini, Antonio e OpenAI)</span>
             </li>
             <li className="flex items-center gap-2.5 text-zinc-400 dark:text-zinc-500 line-through">
               <Mic size={16} className="shrink-0" />
-              <span>Ditar itens por comando de voz (Whisper)</span>
+              <span>Ditar itens por comando de voz (Whisper / Gemini)</span>
             </li>
           </ul>
 
           <div className="p-3 bg-zinc-200/50 dark:bg-zinc-800/50 rounded-xl text-center text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-            {userData?.plan === 'pro' ? 'Você já possui o Plano Pro' : 'Seu plano atual'}
+            {isPro
+              ? 'Você já possui o Plano Pro'
+              : `Seu plano atual • ${trialDaysRemaining} ${trialDaysRemaining === 1 ? 'dia restante' : 'dias restantes'} de teste`}
           </div>
         </div>
 
-        {/* Pro Plan / Launch Promotion */}
+        {/* Pro Plan */}
         <div className="flex-[1.25] p-6 sm:p-8 md:p-10 bg-white dark:bg-zinc-900 relative flex flex-col">
-          <div className="absolute top-0 inset-x-0 h-1.5 bg-gradient-to-r from-amber-500 via-indigo-600 to-purple-600"></div>
+          <div className="absolute top-0 inset-x-0 h-1.5 bg-gradient-to-r from-amber-500 via-indigo-600 to-purple-600" />
 
           {triggerReason && (
             <div className="mb-4 p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/60 rounded-xl text-xs text-amber-800 dark:text-amber-300 font-medium">
-              ⚡ {triggerReason}
+              {triggerReason}
+            </div>
+          )}
+
+          {statusMessage && (
+            <div
+              className={`mb-4 p-3 rounded-xl text-xs flex items-start gap-2 border ${
+                statusMessage.type === 'error'
+                  ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300'
+                  : statusMessage.type === 'success'
+                  ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900/60 text-emerald-700 dark:text-emerald-300'
+                  : 'bg-blue-50 dark:bg-blue-950/40 border-blue-200 dark:border-blue-900/60 text-blue-700 dark:text-blue-300'
+              }`}
+            >
+              {statusMessage.type === 'success' ? (
+                <CheckCircle2 size={15} className="shrink-0 mt-0.5" />
+              ) : (
+                <AlertCircle size={15} className="shrink-0 mt-0.5" />
+              )}
+              <span>{statusMessage.text}</span>
             </div>
           )}
 
@@ -167,9 +217,9 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
               </div>
               <h3 className="text-2xl sm:text-3xl font-extrabold text-zinc-900 dark:text-white">Plano Pro</h3>
             </div>
-            
-            <button 
-              onClick={() => setCurrency(c => c === 'BRL' ? 'USD' : 'BRL')}
+
+            <button
+              onClick={() => setCurrency(c => (c === 'BRL' ? 'USD' : 'BRL'))}
               className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-xs font-semibold hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
             >
               <Globe size={13} />
@@ -184,8 +234,8 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
                 key={type}
                 onClick={() => setPlanType(type)}
                 className={`py-2 px-2 text-xs font-bold rounded-xl transition-all relative ${
-                  planType === type 
-                    ? 'bg-white dark:bg-zinc-700 shadow-md text-zinc-900 dark:text-white scale-[1.02]' 
+                  planType === type
+                    ? 'bg-white dark:bg-zinc-700 shadow-md text-zinc-900 dark:text-white scale-[1.02]'
                     : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'
                 }`}
               >
@@ -214,17 +264,17 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
           </div>
 
           <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-6">
-            Após 7 dias grátis, aproveite a tarifa promocional de lançamento com desbloqueio integral.
+            Desbloqueio integral de documentos, vozes neurais e sincronização segura na sua conta Google.
           </p>
 
-          <ul className="space-y-3 mb-8 flex-1 text-xs text-zinc-800 dark:text-zinc-200">
+          <ul className="space-y-3 mb-6 flex-1 text-xs text-zinc-800 dark:text-zinc-200">
             <li className="flex items-center gap-2.5">
               <Check size={16} className="text-emerald-500 shrink-0" />
-              <span><strong>Itens e Leituras Ilimitadas:</strong> crie quantas anotações desejar</span>
+              <span><strong>Leituras Ilimitadas:</strong> até 3 documentos simultâneos sem limite por fonte</span>
             </li>
             <li className="flex items-center gap-2.5">
               <Check size={16} className="text-emerald-500 shrink-0" />
-              <span><strong>Categorias Personalizadas Ilimitadas:</strong> organize seus estudos</span>
+              <span><strong>Itens e Categorias Ilimitadas:</strong> organize estudos sem bloqueios</span>
             </li>
             <li className="flex items-center gap-2.5">
               <Check size={16} className="text-emerald-500 shrink-0" />
@@ -232,72 +282,63 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
             </li>
             <li className="flex items-center gap-2.5">
               <Check size={16} className="text-emerald-500 shrink-0" />
-              <span><strong>Ouvir Lista com Vozes Naturais de IA:</strong> Gemini, Microsoft Antonio e OpenAI</span>
+              <span><strong>Vozes Naturais de IA:</strong> ElevenLabs, Gemini, Antonio e OpenAI</span>
             </li>
             <li className="flex items-center gap-2.5">
               <Check size={16} className="text-emerald-500 shrink-0" />
-              <span><strong>Ditar Itens por Comando de Voz:</strong> Whisper e Gemini integrados</span>
+              <span><strong>Ditado por Comando de Voz:</strong> Whisper e Gemini integrados</span>
             </li>
           </ul>
 
           {/* Payment Method Selector */}
-          <div className="flex items-center justify-between text-xs text-zinc-500 mb-4 px-1">
-            <span>Pagamento Seguro via:</span>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500 mb-4 px-1">
+            <span>Plataforma de Pagamento:</span>
             <div className="flex items-center gap-2">
-              <button 
-                onClick={() => setPaymentProvider('paddle')}
-                className={`px-2 py-0.5 rounded border text-[11px] font-bold ${paymentProvider === 'paddle' ? 'border-indigo-600 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600' : 'border-zinc-300 dark:border-zinc-700'}`}
+              <button
+                onClick={() => {
+                  setPaymentProvider('paddle');
+                  setStatusMessage(null);
+                }}
+                className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-colors ${
+                  paymentProvider === 'paddle'
+                    ? 'border-indigo-600 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400'
+                    : 'border-zinc-300 dark:border-zinc-700'
+                }`}
               >
-                Paddle
+                Paddle (Web • Cartão / Google Pay)
               </button>
-              <button 
-                onClick={() => setPaymentProvider('revenuecat')}
-                className={`px-2 py-0.5 rounded border text-[11px] font-bold ${paymentProvider === 'revenuecat' ? 'border-indigo-600 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600' : 'border-zinc-300 dark:border-zinc-700'}`}
+              <button
+                onClick={() => {
+                  setPaymentProvider('revenuecat');
+                  setStatusMessage(null);
+                }}
+                className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-colors ${
+                  paymentProvider === 'revenuecat'
+                    ? 'border-indigo-600 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400'
+                    : 'border-zinc-300 dark:border-zinc-700'
+                }`}
               >
-                RevenueCat (iOS App Store)
+                RevenueCat (iOS / Android)
               </button>
             </div>
           </div>
 
-          <button 
+          <button
             onClick={handleSubscribe}
-            disabled={loading || userData?.plan === 'pro'}
+            disabled={loading || isPro}
             className="w-full flex items-center justify-center gap-2 py-3.5 px-4 rounded-2xl font-bold text-sm bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-700 hover:to-indigo-800 text-white shadow-xl shadow-indigo-500/25 transition-all disabled:opacity-50"
           >
-            {loading ? 'Processando Assinatura...' : userData?.plan === 'pro' ? 'Você já é Assinante Pro!' : `Assinar ${planType === 'monthly' ? 'Mensal' : planType === 'annual' ? 'Anual' : 'Vitalício'} (${prices[currency][planType].amount})`}
-            {!loading && userData?.plan !== 'pro' && <CreditCard size={18} />}
+            {loading
+              ? 'Processando...'
+              : isPro
+              ? 'Você já é Assinante Pro!'
+              : `Assinar ${planType === 'monthly' ? 'Mensal' : planType === 'annual' ? 'Anual' : 'Vitalício'} (${prices[currency][planType].amount})`}
+            {!loading && !isPro && <CreditCard size={18} />}
           </button>
 
-          {userData?.plan !== 'pro' && (
+          {isPro && (
             <button
-              onClick={async () => {
-                setLoading(true);
-                try {
-                  await fetchWithAuth('/api/checkout', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ planType: 'lifetime', currency: 'BRL', provider: 'instant_free' })
-                  });
-                  window.dispatchEvent(new Event('readerai_auth_changed'));
-                  alert("🎉 Plano Pro Ilimitado ativado com sucesso para sua conta!");
-                  onClose();
-                } catch (e: any) {
-                  onClose();
-                } finally {
-                  setLoading(false);
-                }
-              }}
-              disabled={loading}
-              className="mt-2.5 w-full py-2.5 px-4 rounded-xl font-bold text-xs bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 border border-emerald-200 dark:border-emerald-800 transition-all flex items-center justify-center gap-1.5"
-            >
-              <Sparkles size={14} />
-              <span>Ativar Plano Pro Gratuitamente (Acesso Imediato)</span>
-            </button>
-          )}
-
-          {userData?.plan === 'pro' && (
-            <button
-              onClick={() => openPaddleCustomerPortal(userData?.paddleCustomerId)}
+              onClick={() => openPaddleCustomerPortal((userData as any)?.paddleCustomerId)}
               className="mt-2 w-full py-2 px-3 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
             >
               <span>Gerenciar Assinatura & Faturas (Portal Paddle)</span>
@@ -305,12 +346,26 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({ isOpen, on
             </button>
           )}
 
+          {isAdmin && (
+            <button
+              onClick={handleAdminToggle}
+              disabled={loading}
+              className="mt-2.5 w-full py-2 px-3 rounded-xl font-semibold text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 border border-zinc-200 dark:border-zinc-700 transition-colors flex items-center justify-center gap-1.5"
+            >
+              <ShieldAlert size={14} className="text-indigo-500" />
+              <span>
+                {isPro
+                  ? 'Admin: Simular Plano Gratuito (testar limites)'
+                  : 'Admin: Voltar para Plano Pro'}
+              </span>
+            </button>
+          )}
+
           <p className="text-[10px] text-center text-zinc-400 mt-3 flex items-center justify-center gap-1">
             <Shield size={12} />
-            <span>Cancelamento fácil a qualquer momento • Pagamento seguro e criptografado</span>
+            <span>Cancelamento fácil a qualquer momento • Liberação segura via webhook</span>
           </p>
         </div>
-
       </div>
     </div>
   );

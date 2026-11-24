@@ -1,5 +1,4 @@
-import React, { useEffect, useCallback, useRef } from 'react';
-import { motion } from 'motion/react';
+import React, { useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 
 interface SelectionInfo {
   text: string;
@@ -21,6 +20,8 @@ interface ContentDisplayProps {
   selectionInfo?: SelectionInfo | null;
 }
 
+let globalDomRevisionCounter = 0;
+
 export const ContentDisplay: React.FC<ContentDisplayProps> = React.memo(({
   content,
   contentType,
@@ -35,25 +36,51 @@ export const ContentDisplay: React.FC<ContentDisplayProps> = React.memo(({
   selectionInfo,
 }) => {
   const selectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const localDivRef = useRef<HTMLDivElement | null>(null);
+  const lastAppliedHtmlRef = useRef<string | null>(null);
+
+  // Apply raw HTML ONLY when content truly changes so React re-renders (e.g. isSpeaking, selectionInfo, zoom)
+  // never wipe out live TTS .tts-sentence / .tts-word / .tts-current-word DOM highlights.
+  useLayoutEffect(() => {
+    const el = localDivRef.current;
+    if (!el || contentType === 'url') return;
+
+    if (contentRef) {
+      (contentRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+    }
+
+    if (lastAppliedHtmlRef.current !== content) {
+      el.innerHTML = content;
+      lastAppliedHtmlRef.current = content;
+      globalDomRevisionCounter += 1;
+      el.dataset.ttsDomRevision = String(globalDomRevisionCounter);
+    }
+  }, [content, contentType, contentRef]);
+
+  useEffect(() => {
+    return () => {
+      lastAppliedHtmlRef.current = null;
+    };
+  }, []);
 
   const updateSelection = useCallback((isFinished: boolean = false) => {
     const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0 || !contentRef.current) {
-      if (selectionInfo && !isFinished) {
+    const container = localDivRef.current || contentRef.current;
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0 || !container) {
+      if (selectionInfo) {
         onSelectionChange(false, null);
       }
       return;
     }
 
     const range = selection.getRangeAt(0);
-    const container = contentRef.current;
     
     const isInside = container.contains(range.commonAncestorContainer) || 
                      container.contains(selection.anchorNode) || 
                      container.contains(selection.focusNode);
 
     if (!isInside) {
-      if (selectionInfo && !isFinished) {
+      if (selectionInfo) {
         onSelectionChange(false, null);
       }
       return;
@@ -61,6 +88,9 @@ export const ContentDisplay: React.FC<ContentDisplayProps> = React.memo(({
 
     const text = selection.toString().trim();
     if (!text) {
+      if (selectionInfo) {
+        onSelectionChange(false, null);
+      }
       return;
     }
 
@@ -79,7 +109,7 @@ export const ContentDisplay: React.FC<ContentDisplayProps> = React.memo(({
     } else {
       onSelectionChange(true, info);
     }
-  }, [contentRef, isHighlightMode, onSelectionChange, onHighlightText]);
+  }, [contentRef, isHighlightMode, onSelectionChange, onHighlightText, selectionInfo]);
 
   useEffect(() => {
     return () => {
@@ -103,14 +133,6 @@ export const ContentDisplay: React.FC<ContentDisplayProps> = React.memo(({
     }
   };
 
-  const handleClearSelection = () => {
-    const selection = window.getSelection();
-    if (selection) {
-      selection.removeAllRanges();
-    }
-    onSelectionChange(false, null);
-  };
-
   const cursorStyle = isHighlightMode ? { cursor: 'text' } : {};
 
   return (
@@ -126,10 +148,9 @@ export const ContentDisplay: React.FC<ContentDisplayProps> = React.memo(({
           <iframe src={sourceUrl} className="w-full h-[80vh] border-0 rounded-2xl shadow-xl bg-white" title="Web Content" />
         ) : (
           <div
-            ref={contentRef}
+            ref={localDivRef}
             style={{ fontSize: zoom !== 100 ? `${zoom}%` : undefined }}
             className="prose dark:prose-invert bg-white dark:bg-zinc-900 p-6 md:p-16 rounded-3xl shadow-sm border border-zinc-200 dark:border-zinc-800 select-text transition-all duration-150 touch-manipulation focus:outline-none"
-            dangerouslySetInnerHTML={{ __html: content }}
           />
         )}
       </div>

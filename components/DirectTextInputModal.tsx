@@ -35,12 +35,14 @@ export const DirectTextInputModal: React.FC<DirectTextInputModalProps> = ({
         if (clipText) {
           setText(prev => (prev ? prev + '\n\n' + clipText : clipText));
           setError('');
+        } else {
+          setError('A área de transferência está vazia. Use Ctrl+V ou Cmd+V para colar.');
         }
       } else {
-        alert('Seu navegador não permite acesso direto à área de transferência. Use Ctrl+V ou Cmd+V.');
+        setError('Seu navegador não permite acesso direto à área de transferência. Use Ctrl+V ou Cmd+V.');
       }
     } catch {
-      alert('Permissão para ler a área de transferência negada ou indisponível.');
+      setError('Permissão para ler a área de transferência negada. Cole diretamente no campo usando Ctrl+V ou Cmd+V.');
     }
   };
 

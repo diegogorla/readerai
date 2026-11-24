@@ -74,9 +74,15 @@ function mapWordsToOffsets(sentenceText: string, wordEls: HTMLElement[]): Uttera
 }
 
 function wrapTextNodesInWords(root: HTMLElement) {
+  const skippedTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'BUTTON', 'TEXTAREA', 'INPUT', 'SELECT', 'OPTION']);
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: (node) => {
-      if (node.parentElement?.classList.contains('tts-word')) {
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (parent.closest('.tts-word')) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (skippedTags.has(parent.tagName)) {
         return NodeFilter.FILTER_REJECT;
       }
       return node.nodeValue?.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
@@ -111,7 +117,25 @@ function wrapTextNodesInWords(root: HTMLElement) {
   });
 }
 
-export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileContent?: string) => {
+function buildWordIntervals(words: UtteranceWord[]) {
+  let accum = 0;
+  const intervals = words.map(w => {
+    const pauseBonus = /[.!?]$/.test(w.text) ? 4 : /[,;:]$/.test(w.text) ? 2 : 0;
+    const weight = Math.max(2, w.text.length) + pauseBonus;
+    const start = accum;
+    accum += weight;
+    const end = accum;
+    return { w, start, end, weight };
+  });
+  return { intervals, totalWeight: Math.max(1, accum) };
+}
+
+export const useSpeech = (
+  contentRef: RefObject<HTMLDivElement | null>,
+  fileContent?: string,
+  activeDocumentId?: string | null,
+  isDocumentVisible: boolean = true
+) => {
   const [ttsState, setTtsState] = useState<TTSState>(() => {
     let initialVoice = ELEVENLABS_DGORLA_VOICE;
     try {
@@ -138,19 +162,29 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
 
   const utteranceQueueRef = useRef<UtteranceItem[]>([]);
   const currentUtteranceIndexRef = useRef(0);
+  const startWordOffsetRef = useRef(0);
+  const activeWordsRef = useRef<UtteranceWord[]>([]);
   const recognitionRef = useRef<any>(null);
   const resumePlaybackRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const currentBlobUrlRef = useRef<string | null>(null);
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const currentHighlightedWordRef = useRef<HTMLElement | null>(null);
+  const activeSentenceElsRef = useRef<HTMLElement[]>([]);
   const audioRafRef = useRef<number | null>(null);
+  const nativeFallbackRafRef = useRef<number | null>(null);
+  const builtForContainerRef = useRef<HTMLDivElement | null>(null);
+  const builtForRevisionRef = useRef<string | undefined>(undefined);
+  const playbackSessionIdRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const pendingPlayTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Auto-scroll control refs
   const userScrolledRef = useRef(false);
   const isProgrammaticScrollRef = useRef(false);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Stop auto-scroll when user moves the scrollbar or scrolls with touch/wheel
+  // Stop auto-scroll only on explicit user scroll input
   useEffect(() => {
     const handleUserScroll = () => {
       if (isProgrammaticScrollRef.current) return;
@@ -162,54 +196,89 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
 
     window.addEventListener('wheel', handleUserScroll, { capture: true, passive: true });
     window.addEventListener('touchmove', handleUserScroll, { capture: true, passive: true });
-    window.addEventListener('scroll', handleUserScroll, { capture: true, passive: true });
 
     return () => {
       window.removeEventListener('wheel', handleUserScroll, { capture: true });
       window.removeEventListener('touchmove', handleUserScroll, { capture: true });
-      window.removeEventListener('scroll', handleUserScroll, { capture: true });
     };
   }, []);
 
+  const stopHighlightAnimLoops = useCallback(() => {
+    if (audioRafRef.current) {
+      cancelAnimationFrame(audioRafRef.current);
+      audioRafRef.current = null;
+    }
+    if (nativeFallbackRafRef.current) {
+      cancelAnimationFrame(nativeFallbackRafRef.current);
+      nativeFallbackRafRef.current = null;
+    }
+  }, []);
+
   const removeHighlights = useCallback(() => {
+    stopHighlightAnimLoops();
     if (contentRef.current) {
-      const activeElements = contentRef.current.querySelectorAll('.tts-active-sentence, .tts-current-word');
-      activeElements.forEach(el => el.classList.remove('tts-active-sentence', 'tts-current-word'));
+      const activeElements = contentRef.current.querySelectorAll(
+        '.tts-active-sentence, .tts-active-sentence-word, .tts-current-word'
+      );
+      activeElements.forEach(el =>
+        el.classList.remove('tts-active-sentence', 'tts-active-sentence-word', 'tts-current-word')
+      );
+    }
+    if (activeSentenceElsRef.current.length > 0) {
+      activeSentenceElsRef.current.forEach(el =>
+        el.classList.remove('tts-active-sentence', 'tts-active-sentence-word')
+      );
+      activeSentenceElsRef.current = [];
     }
     if (currentHighlightedWordRef.current) {
       currentHighlightedWordRef.current.classList.remove('tts-current-word');
       currentHighlightedWordRef.current = null;
     }
-    if (audioRafRef.current) {
-      cancelAnimationFrame(audioRafRef.current);
-      audioRafRef.current = null;
-    }
-  }, [contentRef]);
+  }, [contentRef, stopHighlightAnimLoops]);
 
   const cleanupSpeech = useCallback(() => {
-    if (audioRafRef.current) {
-      cancelAnimationFrame(audioRafRef.current);
-      audioRafRef.current = null;
+    // Invalidate all in-flight async TTS requests, callbacks, and timers immediately
+    playbackSessionIdRef.current += 1;
+
+    if (pendingPlayTimeoutRef.current) {
+      clearTimeout(pendingPlayTimeoutRef.current);
+      pendingPlayTimeoutRef.current = null;
     }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    stopHighlightAnimLoops();
     if (currentUtteranceRef.current) {
+      currentUtteranceRef.current.onstart = null;
       currentUtteranceRef.current.onend = null;
       currentUtteranceRef.current.onerror = null;
       currentUtteranceRef.current.onboundary = null;
+      currentUtteranceRef.current = null;
     }
-    if (window.speechSynthesis) {
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
     if (audioRef.current) {
+      // Clear ALL event handlers BEFORE pausing/removing src so onerror NEVER triggers fallback voice!
+      audioRef.current.onplay = null;
+      audioRef.current.onplaying = null;
       audioRef.current.onended = null;
+      audioRef.current.onerror = null;
+      audioRef.current.onpause = null;
       audioRef.current.pause();
-      audioRef.current.src = '';
+      audioRef.current.removeAttribute('src');
+    }
+    if (currentBlobUrlRef.current) {
+      URL.revokeObjectURL(currentBlobUrlRef.current);
+      currentBlobUrlRef.current = null;
     }
     removeHighlights();
-  }, [removeHighlights]);
+  }, [removeHighlights, stopHighlightAnimLoops]);
 
   // Smooth auto-scroll keeping word/sentence comfortably centered
   const scrollElementIntoViewIfNeeded = useCallback((element: HTMLElement, forceCenter = false) => {
-    if (userScrolledRef.current) return;
+    if (userScrolledRef.current || !element.isConnected) return;
 
     const rect = element.getBoundingClientRect();
     const vHeight = window.innerHeight || document.documentElement.clientHeight;
@@ -227,12 +296,13 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
       scrollTimeoutRef.current = setTimeout(() => {
         isProgrammaticScrollRef.current = false;
-      }, 700);
+      }, 1050);
     }
   }, []);
 
   const setWordHighlight = useCallback((wordEl: HTMLElement) => {
-    if (currentHighlightedWordRef.current === wordEl) return;
+    if (!wordEl || !wordEl.isConnected) return;
+    if (currentHighlightedWordRef.current === wordEl && wordEl.classList.contains('tts-current-word')) return;
 
     if (currentHighlightedWordRef.current) {
       currentHighlightedWordRef.current.classList.remove('tts-current-word');
@@ -245,6 +315,36 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
       scrollElementIntoViewIfNeeded(wordEl, false);
     }
   }, [scrollElementIntoViewIfNeeded]);
+
+  const applySentenceHighlight = useCallback((utterance: UtteranceItem, activeWordEls: HTMLElement[]) => {
+    removeHighlights();
+
+    const tracked: HTMLElement[] = [];
+    if (
+      utterance.sentenceElement &&
+      utterance.sentenceElement.isConnected &&
+      utterance.sentenceElement.classList.contains('tts-sentence')
+    ) {
+      utterance.sentenceElement.classList.add('tts-active-sentence');
+      tracked.push(utterance.sentenceElement);
+    }
+
+    // Also highlight every word in the active sentence so multi-sentence rich HTML blocks
+    // (containing <b>, <i>, <mark>, <a>, <br>) highlight ONLY the active sentence cleanly.
+    utterance.wordElements.forEach(wEl => {
+      if (wEl.isConnected) {
+        wEl.classList.add('tts-active-sentence-word');
+        tracked.push(wEl);
+      }
+    });
+
+    activeSentenceElsRef.current = tracked;
+
+    const firstWord = activeWordEls[0] || utterance.wordElements[0];
+    if (firstWord && firstWord.isConnected) {
+      setWordHighlight(firstWord);
+    }
+  }, [removeHighlights, setWordHighlight]);
 
   const handleResumeAutoScroll = useCallback(() => {
     userScrolledRef.current = false;
@@ -263,14 +363,14 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
     }
   }, []);
 
-  // Helper to retrieve auth token (Firebase token or 2FA session token)
+  // Helper to retrieve Firebase ID token
   const getAuthToken = useCallback(async () => {
     if (auth.currentUser) {
       try {
         return await auth.currentUser.getIdToken();
       } catch {}
     }
-    return typeof window !== 'undefined' ? localStorage.getItem('readerai_session_token') || null : null;
+    return null;
   }, []);
 
   const getLocalVoices = useCallback(() => {
@@ -411,338 +511,20 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
     }
   }, [getLocalVoices, cleanupSpeech]);
 
-  // Synchronize words with audio playback via requestAnimationFrame
-  const syncWordsWithAudio = useCallback((utterance: UtteranceItem, audio: HTMLAudioElement) => {
-    if (audioRafRef.current) cancelAnimationFrame(audioRafRef.current);
-
-    const words = utterance.words;
-    if (words.length === 0) return;
-
-    const totalChars = words.reduce((acc, w) => acc + Math.max(2, w.text.length) + (/[.,!?;:]$/.test(w.text) ? 2 : 0), 0);
-    let accum = 0;
-    const wordIntervals = words.map(w => {
-      const weight = Math.max(2, w.text.length) + (/[.,!?;:]$/.test(w.text) ? 2 : 0);
-      const start = accum;
-      accum += weight;
-      const end = accum;
-      return { w, start, end, weight };
-    });
-
-    const checkFrame = () => {
-      if (!audio || audio.paused || audio.ended) return;
-      const duration = audio.duration;
-      if (duration > 0) {
-        const curTime = audio.currentTime;
-        const progress = Math.min(1, Math.max(0, curTime / duration));
-        const targetCharPos = progress * totalChars;
-
-        let match = wordIntervals.find(t => targetCharPos >= t.start && targetCharPos < t.end);
-        if (!match && wordIntervals.length > 0) {
-          match = wordIntervals[progress >= 1 ? wordIntervals.length - 1 : 0];
-        }
-
-        if (match?.w.el) {
-          setWordHighlight(match.w.el);
-        }
-      }
-      audioRafRef.current = requestAnimationFrame(checkFrame);
-    };
-
-    audioRafRef.current = requestAnimationFrame(checkFrame);
-  }, [setWordHighlight]);
-
-  // Playback queue runner with sentence highlighting, word tracking, and smooth scrolling
-  const playQueue = useCallback(async () => {
-    if (currentUtteranceIndexRef.current >= utteranceQueueRef.current.length) {
-      setTtsState(prev => ({ ...prev, isSpeaking: false, isPaused: false }));
-      removeHighlights();
-      return;
-    }
-
-    const currentUtterance = utteranceQueueRef.current[currentUtteranceIndexRef.current];
-    const sentenceElement = currentUtterance.sentenceElement;
-    const text = currentUtterance.text;
-    const voice = ttsState.selectedVoice;
-
-    if (!voice) return;
-
-    if (!text.trim()) {
-      currentUtteranceIndexRef.current++;
-      playQueue();
-      return;
-    }
-
-    removeHighlights();
-    sentenceElement.classList.add('tts-active-sentence');
-
-    // Auto-scroll to center sentence if user hasn't scrolled manually
-    if (!userScrolledRef.current) {
-      scrollElementIntoViewIfNeeded(sentenceElement, true);
-    }
-
-    // Native Web Speech API execution helper
-    const playWithNativeSpeech = () => {
-      if (!('speechSynthesis' in window)) return;
-      const utterance = new SpeechSynthesisUtterance(text);
-      if (voice.nativeVoice) {
-        utterance.voice = voice.nativeVoice;
-      } else {
-        // Find best match in browser voices
-        const browserVoices = window.speechSynthesis.getVoices();
-        const bestVoice = browserVoices.find(v => v.lang.startsWith('pt')) || browserVoices[0];
-        if (bestVoice) utterance.voice = bestVoice;
-      }
-      utterance.lang = voice.lang || 'pt-BR';
-      utterance.rate = ttsState.rate;
-
-      (window as any).currentUtterance = utterance;
-
-      utterance.onboundary = (e: any) => {
-        if (e.name === 'word') {
-          const charIndex = e.charIndex;
-          const words = currentUtterance.words;
-          let match = words.find(w => charIndex >= w.startChar && charIndex < w.endChar);
-          if (!match) {
-            match = words.find(w => w.startChar >= charIndex);
-          }
-          if (!match && words.length > 0) {
-            match = words[words.length - 1];
-          }
-          if (match?.el) {
-            setWordHighlight(match.el);
-          }
-        }
-      };
-
-      utterance.onend = () => {
-        removeHighlights();
-        currentUtteranceIndexRef.current++;
-        playQueue();
-      };
-
-      utterance.onerror = (e: SpeechSynthesisErrorEvent) => {
-        removeHighlights();
-        if (e.error === 'interrupted' || e.error === 'canceled') return;
-        console.error("Speech synthesis error:", e.error);
-        setTtsState(prev => ({ ...prev, isSpeaking: false, isPaused: false }));
-      };
-
-      currentUtteranceRef.current = utterance;
-      window.speechSynthesis.speak(utterance);
-      setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
-    };
-
-    // Play with ElevenLabs TTS (Dgorla and custom voices)
-    if (voice.isElevenLabs || voice.provider === 'elevenlabs') {
-      try {
-        const token = await getAuthToken();
-        const response = await fetch('/api/elevenlabs/tts', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-          },
-          body: JSON.stringify({
-            text,
-            voiceId: voice.id,
-            voiceName: voice.name
-          }),
-        });
-
-        if (!response.ok) {
-          console.warn("ElevenLabs TTS error, falling back to native:", response.status);
-          playWithNativeSpeech();
-          return;
-        }
-
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-
-        if (!audioRef.current) {
-          audioRef.current = new Audio();
-        }
-
-        audioRef.current.src = url;
-        audioRef.current.playbackRate = ttsState.rate;
-
-        audioRef.current.onplay = () => {
-          syncWordsWithAudio(currentUtterance, audioRef.current!);
-        };
-
-        audioRef.current.onended = () => {
-          removeHighlights();
-          currentUtteranceIndexRef.current++;
-          playQueue();
-        };
-
-        audioRef.current.onerror = (err) => {
-          console.error("ElevenLabs audio play error:", err);
-          playWithNativeSpeech();
-        };
-
-        await audioRef.current.play();
-        setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
-      } catch (error: any) {
-        console.warn("ElevenLabs network error, falling back to native:", error);
-        playWithNativeSpeech();
-      }
-    } else if (voice.isGemini) {
-      try {
-        const token = await getAuthToken();
-        const response = await fetch('/api/gemini/tts', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-          },
-          body: JSON.stringify({
-            text,
-            voiceName: voice.id
-          }),
-        });
-
-        if (!response.ok) {
-          playWithNativeSpeech();
-          return;
-        }
-
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-
-        if (!audioRef.current) {
-          audioRef.current = new Audio();
-        }
-
-        audioRef.current.src = url;
-        audioRef.current.playbackRate = ttsState.rate;
-
-        audioRef.current.onplay = () => {
-          syncWordsWithAudio(currentUtterance, audioRef.current!);
-        };
-
-        audioRef.current.onended = () => {
-          removeHighlights();
-          currentUtteranceIndexRef.current++;
-          playQueue();
-        };
-
-        audioRef.current.onerror = (err) => {
-          console.error("Gemini audio play error:", err);
-          playWithNativeSpeech();
-        };
-
-        await audioRef.current.play();
-        setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
-      } catch (error: any) {
-        console.warn("Gemini network error, falling back to system voice:", error);
-        playWithNativeSpeech();
-      }
-    } else if (voice.isMicrosoft || voice.id === 'ms-antonio-neural') {
-      // If native Antonio is available in browser speech synthesis, use it directly
-      if (voice.nativeVoice) {
-        playWithNativeSpeech();
-      } else {
-        try {
-          const token = await auth.currentUser?.getIdToken();
-          const response = await fetch('/api/microsoft/tts', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-            },
-            body: JSON.stringify({ text, voiceName: 'pt-BR-AntonioNeural' }),
-          });
-
-          if (!response.ok) {
-            playWithNativeSpeech();
-            return;
-          }
-
-          const blob = await response.blob();
-          const url = URL.createObjectURL(blob);
-
-          if (!audioRef.current) {
-            audioRef.current = new Audio();
-          }
-
-          audioRef.current.src = url;
-          audioRef.current.playbackRate = ttsState.rate;
-
-          audioRef.current.onplay = () => {
-            syncWordsWithAudio(currentUtterance, audioRef.current!);
-          };
-
-          audioRef.current.onended = () => {
-            removeHighlights();
-            currentUtteranceIndexRef.current++;
-            playQueue();
-          };
-
-          audioRef.current.onerror = () => {
-            playWithNativeSpeech();
-          };
-
-          await audioRef.current.play();
-          setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
-        } catch {
-          playWithNativeSpeech();
-        }
-      }
-    } else if (voice.isOpenAI) {
-      try {
-        const token = await auth.currentUser?.getIdToken();
-        const response = await fetch('/api/openai/tts', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-          },
-          body: JSON.stringify({ text, voiceName: voice.id }),
-        });
-
-        if (!response.ok) {
-          playWithNativeSpeech();
-          return;
-        }
-
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-
-        if (!audioRef.current) {
-          audioRef.current = new Audio();
-        }
-
-        audioRef.current.src = url;
-        audioRef.current.playbackRate = ttsState.rate;
-
-        audioRef.current.onplay = () => {
-          syncWordsWithAudio(currentUtterance, audioRef.current!);
-        };
-
-        audioRef.current.onended = () => {
-          removeHighlights();
-          currentUtteranceIndexRef.current++;
-          playQueue();
-        };
-
-        await audioRef.current.play();
-        setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
-      } catch (error: any) {
-        console.warn("OpenAI voice error, using system speech:", error);
-        playWithNativeSpeech();
-      }
-    } else {
-      playWithNativeSpeech();
-    }
-  }, [ttsState.selectedVoice, ttsState.rate, removeHighlights, scrollElementIntoViewIfNeeded, setWordHighlight, syncWordsWithAudio]);
-
   // Build clean utterance queue with sentence-level and word-level DOM wrappers
-  useEffect(() => {
+  const buildUtteranceQueue = useCallback((): UtteranceItem[] => {
     const container = contentRef.current;
-    if (!container || !fileContent) return;
+    if (!container) {
+      utteranceQueueRef.current = [];
+      builtForContainerRef.current = null;
+      builtForRevisionRef.current = undefined;
+      return [];
+    }
 
     const blockSelector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, tr, td, dt, dd';
-    let blocks: HTMLElement[] = Array.from(container.querySelectorAll(blockSelector) as NodeListOf<HTMLElement>);
+    const rawBlocks = Array.from(container.querySelectorAll(blockSelector) as NodeListOf<HTMLElement>);
+    // Avoid duplicating utterances when block elements are nested (e.g., <tr><td><p>, <blockquote><p>)
+    let blocks = rawBlocks.filter(b => !b.querySelector(blockSelector));
     if (blocks.length === 0) {
       blocks = (Array.from(container.querySelectorAll('div') as NodeListOf<HTMLElement>)).filter(d => !d.querySelector('div'));
     }
@@ -765,7 +547,11 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
         existingSentences.forEach(sEl => {
           const sText = (sEl.textContent || '').trim();
           if (!sText) return;
-          const wordEls: HTMLElement[] = Array.from(sEl.querySelectorAll('.tts-word') as NodeListOf<HTMLElement>);
+          let wordEls: HTMLElement[] = Array.from(sEl.querySelectorAll('.tts-word') as NodeListOf<HTMLElement>);
+          if (wordEls.length === 0) {
+            wrapTextNodesInWords(sEl);
+            wordEls = Array.from(sEl.querySelectorAll('.tts-word') as NodeListOf<HTMLElement>);
+          }
           const words = mapWordsToOffsets(sText, wordEls);
           queue.push({
             id: globalUtteranceId++,
@@ -816,7 +602,7 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
           });
         });
       } else {
-        // Block has child elements (<b>, <mark>, etc.): wrap text nodes without destroying child elements
+        // Block has child elements (<b>, <mark>, <a>, <br>, etc.): wrap text nodes without destroying tags
         wrapTextNodesInWords(block);
 
         const wordEls: HTMLElement[] = Array.from(block.querySelectorAll('.tts-word') as NodeListOf<HTMLElement>);
@@ -844,11 +630,27 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
             blockElement: block,
           });
         } else {
-          // Group words into sentences based on terminal punctuation
+          // Group words into sentences based on terminal punctuation or explicit <br> breaks
           let currentGroup: HTMLElement[] = [];
           const sentenceGroups: HTMLElement[][] = [];
 
-          wordEls.forEach(wEl => {
+          const hasBrBetween = (prevEl: HTMLElement, nextEl: HTMLElement): boolean => {
+            try {
+              const range = document.createRange();
+              range.setStartAfter(prevEl);
+              range.setEndBefore(nextEl);
+              const frag = range.cloneContents();
+              return Boolean(frag.querySelector('br'));
+            } catch {
+              return false;
+            }
+          };
+
+          wordEls.forEach((wEl, idx) => {
+            if (idx > 0 && currentGroup.length > 0 && hasBrBetween(wordEls[idx - 1], wEl)) {
+              sentenceGroups.push(currentGroup);
+              currentGroup = [];
+            }
             currentGroup.push(wEl);
             const wText = (wEl.textContent || '').trim();
             if (/[.!?:\n]$/.test(wText)) {
@@ -863,7 +665,7 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
           sentenceGroups.forEach(group => {
             const sText = group.map(w => w.textContent || '').join(' ').trim();
             if (!sText) return;
-            const sentenceElement = (group[0].parentElement as HTMLElement) || block;
+            const sentenceElement = sentenceGroups.length === 1 ? block : (group[0] as HTMLElement);
             const words = mapWordsToOffsets(sText, group);
             queue.push({
               id: globalUtteranceId++,
@@ -879,61 +681,562 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
     });
 
     utteranceQueueRef.current = queue;
-  }, [contentRef, fileContent]);
+    builtForContainerRef.current = container;
+    builtForRevisionRef.current = container.dataset.ttsDomRevision;
+    return queue;
+  }, [contentRef]);
 
-  const seekToTextOrNode = useCallback((targetNode?: Node | null, selectedText?: string, startPlaying = true) => {
-    const queue = utteranceQueueRef.current;
+  // Self-healing guard: guarantees utteranceQueueRef always references live, connected DOM nodes
+  const ensureQueueReady = useCallback((): UtteranceItem[] => {
+    const container = contentRef.current;
+    if (!container) return [];
+
+    const existing = utteranceQueueRef.current;
+    const firstItem = existing[0];
+    const firstWord = firstItem?.wordElements?.[0];
+    const isStale =
+      existing.length === 0 ||
+      builtForContainerRef.current !== container ||
+      builtForRevisionRef.current !== container.dataset.ttsDomRevision ||
+      !firstItem?.sentenceElement?.isConnected ||
+      (firstWord ? !firstWord.isConnected : false);
+
+    if (isStale) {
+      return buildUtteranceQueue();
+    }
+    return existing;
+  }, [contentRef, buildUtteranceQueue]);
+
+  // Reset playback index when switching active documents
+  useEffect(() => {
+    currentUtteranceIndexRef.current = 0;
+    startWordOffsetRef.current = 0;
+  }, [activeDocumentId]);
+
+  // Rebuild utterance queue when content, document, or visibility changes
+  useEffect(() => {
+    if (!fileContent || !isDocumentVisible) return;
+
+    buildUtteranceQueue();
+    // Retry on next frame in case ContentDisplay/AnimatePresence mounts the DOM node asynchronously
+    const rafId = requestAnimationFrame(() => {
+      ensureQueueReady();
+    });
+
+    return () => cancelAnimationFrame(rafId);
+  }, [contentRef, fileContent, activeDocumentId, isDocumentVisible, buildUtteranceQueue, ensureQueueReady]);
+
+  // Synchronize words with server audio playback via requestAnimationFrame
+  const syncWordsWithAudio = useCallback((words: UtteranceWord[], audio: HTMLAudioElement, sessionId: number) => {
+    if (audioRafRef.current) cancelAnimationFrame(audioRafRef.current);
+    if (words.length === 0) return;
+
+    const { intervals, totalWeight } = buildWordIntervals(words);
+
+    if (words[0]?.el?.isConnected && !currentHighlightedWordRef.current) {
+      setWordHighlight(words[0].el);
+    }
+
+    const checkFrame = () => {
+      if (sessionId !== playbackSessionIdRef.current) return;
+      if (!audio || audio.ended) return;
+      if (audio.paused) {
+        audioRafRef.current = null;
+        return;
+      }
+
+      const rawDuration = audio.duration;
+      const hasFiniteDuration = Number.isFinite(rawDuration) && rawDuration > 0.05;
+      // Guard against Blob MP3s with Infinity or NaN duration until browser metadata resolves
+      const rate = Math.max(0.5, audio.playbackRate || 1);
+      const estimatedDuration = Math.max(0.5, totalWeight / (14.5 * rate));
+      const effectiveDuration = hasFiniteDuration ? rawDuration : estimatedDuration;
+
+      const curTime = Math.max(0, audio.currentTime || 0);
+      const progress = Math.min(0.999, Math.max(0, curTime / effectiveDuration));
+      const targetPos = progress * totalWeight;
+
+      let match = intervals.find(t => targetPos >= t.start && targetPos < t.end);
+      if (!match && intervals.length > 0) {
+        match = intervals[progress >= 0.99 ? intervals.length - 1 : 0];
+      }
+
+      if (match?.w.el?.isConnected) {
+        setWordHighlight(match.w.el);
+      }
+
+      audioRafRef.current = requestAnimationFrame(checkFrame);
+    };
+
+    audioRafRef.current = requestAnimationFrame(checkFrame);
+  }, [setWordHighlight]);
+
+  // Smooth estimated word highlight fallback for native Web Speech voices that never emit onboundary
+  const startNativeWordFallback = useCallback((words: UtteranceWord[], rate: number, sessionId: number) => {
+    if (nativeFallbackRafRef.current) {
+      cancelAnimationFrame(nativeFallbackRafRef.current);
+      nativeFallbackRafRef.current = null;
+    }
+    if (words.length === 0) return;
+
+    const { intervals, totalWeight } = buildWordIntervals(words);
+    const effectiveRate = Math.max(0.5, rate || 1);
+    const estimatedDurationMs = Math.max(450, (totalWeight / (14.5 * effectiveRate)) * 1000);
+
+    let lastTimestamp = performance.now();
+    let elapsedMs = 0;
+
+    if (words[0]?.el?.isConnected) {
+      setWordHighlight(words[0].el);
+    }
+
+    const tick = (now: number) => {
+      if (sessionId !== playbackSessionIdRef.current) return;
+
+      const dt = Math.min(200, Math.max(0, now - lastTimestamp));
+      lastTimestamp = now;
+
+      if (typeof window !== 'undefined' && window.speechSynthesis?.paused) {
+        nativeFallbackRafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+
+      elapsedMs += dt;
+      const progress = Math.min(0.999, Math.max(0, elapsedMs / estimatedDurationMs));
+      const targetPos = progress * totalWeight;
+
+      let match = intervals.find(t => targetPos >= t.start && targetPos < t.end);
+      if (!match && intervals.length > 0) {
+        match = intervals[intervals.length - 1];
+      }
+
+      if (match?.w.el?.isConnected) {
+        setWordHighlight(match.w.el);
+      }
+
+      if (progress < 0.999) {
+        nativeFallbackRafRef.current = requestAnimationFrame(tick);
+      } else {
+        nativeFallbackRafRef.current = null;
+      }
+    };
+
+    nativeFallbackRafRef.current = requestAnimationFrame(tick);
+  }, [setWordHighlight]);
+
+  // Playback queue runner with strict session guards, sentence highlighting, word tracking, and smooth scrolling
+  const playQueue = useCallback(async (expectedSessionId?: number) => {
+    const sessionId = expectedSessionId ?? playbackSessionIdRef.current;
+    if (sessionId !== playbackSessionIdRef.current) return;
+
+    const queue = ensureQueueReady();
+    if (queue.length === 0 || currentUtteranceIndexRef.current >= queue.length) {
+      setTtsState(prev => ({ ...prev, isSpeaking: false, isPaused: false }));
+      removeHighlights();
+      return;
+    }
+
+    const currentUtterance = queue[currentUtteranceIndexRef.current];
+    const sentenceElement = currentUtterance.sentenceElement;
+    const voice = ttsState.selectedVoice;
+
+    if (!voice) return;
+
+    // Support starting mid-sentence when user selects a specific phrase and hits Play
+    const wordOffset = startWordOffsetRef.current;
+    startWordOffsetRef.current = 0;
+
+    const activeWordEls =
+      wordOffset > 0 && wordOffset < currentUtterance.wordElements.length
+        ? currentUtterance.wordElements.slice(wordOffset)
+        : currentUtterance.wordElements;
+
+    const text =
+      wordOffset > 0 && activeWordEls.length > 0
+        ? activeWordEls.map(el => (el.textContent || '').trim()).filter(Boolean).join(' ')
+        : currentUtterance.text;
+
+    const activeWords =
+      wordOffset > 0 && activeWordEls.length > 0
+        ? mapWordsToOffsets(text, activeWordEls)
+        : currentUtterance.words;
+
+    activeWordsRef.current = activeWords;
+
+    if (!text.trim()) {
+      currentUtteranceIndexRef.current++;
+      playQueue(sessionId);
+      return;
+    }
+
+    applySentenceHighlight(currentUtterance, activeWordEls);
+
+    const focusTarget = activeWordEls[0] || currentUtterance.wordElements[0] || sentenceElement;
+    if (focusTarget && !userScrolledRef.current) {
+      scrollElementIntoViewIfNeeded(focusTarget, true);
+    }
+
+    // Native Web Speech API execution helper (strictly guarded by sessionId)
+    const playWithNativeSpeech = () => {
+      if (sessionId !== playbackSessionIdRef.current) return;
+      if (!('speechSynthesis' in window)) return;
+
+      // Guarantee HTMLAudioElement is completely silent before starting Web Speech
+      if (audioRef.current) {
+        audioRef.current.onplay = null;
+        audioRef.current.onplaying = null;
+        audioRef.current.onended = null;
+        audioRef.current.onerror = null;
+        audioRef.current.onpause = null;
+        audioRef.current.pause();
+      }
+      if (currentUtteranceRef.current) {
+        currentUtteranceRef.current.onstart = null;
+        currentUtteranceRef.current.onend = null;
+        currentUtteranceRef.current.onerror = null;
+        currentUtteranceRef.current.onboundary = null;
+      }
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      if (voice.nativeVoice) {
+        utterance.voice = voice.nativeVoice;
+      } else {
+        const browserVoices = window.speechSynthesis.getVoices();
+        const bestVoice = browserVoices.find(v => v.lang.startsWith('pt')) || browserVoices[0];
+        if (bestVoice) utterance.voice = bestVoice;
+      }
+      utterance.lang = voice.lang || 'pt-BR';
+      utterance.rate = ttsState.rate;
+
+      (window as any).currentUtterance = utterance;
+
+      let receivedRealBoundary = false;
+
+      utterance.onstart = () => {
+        if (sessionId !== playbackSessionIdRef.current) return;
+        if (activeWords[0]?.el?.isConnected) {
+          setWordHighlight(activeWords[0].el);
+        }
+        if (!receivedRealBoundary) {
+          startNativeWordFallback(activeWords, ttsState.rate, sessionId);
+        }
+      };
+
+      utterance.onboundary = (e: any) => {
+        if (sessionId !== playbackSessionIdRef.current) return;
+        if (typeof e.charIndex === 'number' && (!e.name || e.name === 'word')) {
+          if (!receivedRealBoundary) {
+            receivedRealBoundary = true;
+            if (nativeFallbackRafRef.current) {
+              cancelAnimationFrame(nativeFallbackRafRef.current);
+              nativeFallbackRafRef.current = null;
+            }
+          }
+          const charIndex = e.charIndex;
+          let match = activeWords.find(w => charIndex >= w.startChar && charIndex < w.endChar);
+          if (!match) {
+            match = activeWords.find(w => w.startChar >= charIndex);
+          }
+          if (!match && activeWords.length > 0) {
+            match = activeWords[activeWords.length - 1];
+          }
+          if (match?.el?.isConnected) {
+            setWordHighlight(match.el);
+          }
+        }
+      };
+
+      utterance.onend = () => {
+        if (sessionId !== playbackSessionIdRef.current) return;
+        removeHighlights();
+        currentUtteranceIndexRef.current++;
+        playQueue(sessionId);
+      };
+
+      utterance.onerror = (e: SpeechSynthesisErrorEvent) => {
+        if (sessionId !== playbackSessionIdRef.current) return;
+        removeHighlights();
+        if (e.error === 'interrupted' || e.error === 'canceled') return;
+        console.error("Speech synthesis error:", e.error);
+        setTtsState(prev => ({ ...prev, isSpeaking: false, isPaused: false }));
+      };
+
+      currentUtteranceRef.current = utterance;
+      window.speechSynthesis.speak(utterance);
+      setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
+    };
+
+    // Shared server audio player helper (strictly guarded by sessionId)
+    const playServerAudio = async (endpoint: string, payload: Record<string, any>) => {
+      if (sessionId !== playbackSessionIdRef.current) return;
+
+      // Cancel any previous fetch
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      // Mark speaking immediately so UI shows active state while fetching
+      setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
+
+      try {
+        const token = await getAuthToken();
+        if (sessionId !== playbackSessionIdRef.current) return;
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+
+        if (sessionId !== playbackSessionIdRef.current) return;
+
+        if (!response.ok) {
+          console.warn(`TTS endpoint ${endpoint} error (${response.status}), falling back to native`);
+          playWithNativeSpeech();
+          return;
+        }
+
+        const blob = await response.blob();
+        if (sessionId !== playbackSessionIdRef.current) return;
+
+        const url = URL.createObjectURL(blob);
+        if (currentBlobUrlRef.current) {
+          URL.revokeObjectURL(currentBlobUrlRef.current);
+        }
+        currentBlobUrlRef.current = url;
+
+        // Guarantee native speech is cancelled before playing audio element
+        if (typeof window !== 'undefined' && window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+        }
+
+        if (!audioRef.current) {
+          audioRef.current = new Audio();
+        }
+        const audio = audioRef.current;
+        audio.onplay = null;
+        audio.onplaying = null;
+        audio.onended = null;
+        audio.onerror = null;
+        audio.onpause = null;
+        audio.pause();
+
+        audio.src = url;
+        audio.playbackRate = ttsState.rate;
+
+        const beginAudioSync = () => {
+          if (sessionId !== playbackSessionIdRef.current) {
+            audio.pause();
+            return;
+          }
+          syncWordsWithAudio(activeWords, audio, sessionId);
+        };
+
+        audio.onplay = beginAudioSync;
+        audio.onplaying = beginAudioSync;
+
+        audio.onended = () => {
+          if (sessionId !== playbackSessionIdRef.current) return;
+          removeHighlights();
+          currentUtteranceIndexRef.current++;
+          playQueue(sessionId);
+        };
+
+        audio.onerror = (err) => {
+          if (sessionId !== playbackSessionIdRef.current) return;
+          console.error(`Audio play error (${endpoint}):`, err);
+          playWithNativeSpeech();
+        };
+
+        await audio.play();
+        if (sessionId !== playbackSessionIdRef.current) {
+          audio.onplay = null;
+          audio.onplaying = null;
+          audio.onended = null;
+          audio.onerror = null;
+          audio.pause();
+          return;
+        }
+        syncWordsWithAudio(activeWords, audio, sessionId);
+        setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
+      } catch (error: any) {
+        if (error?.name === 'AbortError' || sessionId !== playbackSessionIdRef.current) {
+          return;
+        }
+        console.warn(`TTS network/play error (${endpoint}), falling back to native:`, error);
+        playWithNativeSpeech();
+      }
+    };
+
+    if (voice.isElevenLabs || voice.provider === 'elevenlabs') {
+      await playServerAudio('/api/elevenlabs/tts', {
+        text,
+        voiceId: voice.id,
+        voiceName: voice.name,
+      });
+    } else if (voice.isGemini) {
+      await playServerAudio('/api/gemini/tts', {
+        text,
+        voiceName: voice.id,
+      });
+    } else if (voice.isMicrosoft || voice.id === 'ms-antonio-neural') {
+      if (voice.nativeVoice) {
+        playWithNativeSpeech();
+      } else {
+        await playServerAudio('/api/microsoft/tts', {
+          text,
+          voiceName: 'pt-BR-AntonioNeural',
+        });
+      }
+    } else if (voice.isOpenAI) {
+      await playServerAudio('/api/openai/tts', {
+        text,
+        voiceName: voice.id,
+      });
+    } else {
+      playWithNativeSpeech();
+    }
+  }, [
+    ensureQueueReady,
+    ttsState.selectedVoice,
+    ttsState.rate,
+    getAuthToken,
+    removeHighlights,
+    applySentenceHighlight,
+    scrollElementIntoViewIfNeeded,
+    setWordHighlight,
+    syncWordsWithAudio,
+    startNativeWordFallback,
+  ]);
+
+  const seekToTextOrNode = useCallback((
+    targetNode?: Node | null,
+    selectedText?: string,
+    startPlaying = true,
+    range?: Range | null
+  ) => {
+    const queue = ensureQueueReady();
     if (queue.length === 0) return false;
 
     let targetIndex = -1;
-    const cleanSearchText = (selectedText || '').trim().toLowerCase();
+    let targetWordIndex = 0;
+    const cleanSearchText = (selectedText || '').replace(/\s+/g, ' ').trim().toLowerCase();
 
-    // 1. Search by DOM Node inclusion
-    if (targetNode) {
+    // 1. Exact DOM Range intersection against word elements (pinpoints exact sentence AND exact starting word)
+    if (range) {
       for (let i = 0; i < queue.length; i++) {
         const u = queue[i];
-        if (
-          u.sentenceElement.contains(targetNode) ||
-          targetNode.contains(u.sentenceElement) ||
-          u.wordElements.some(w => w.contains(targetNode) || targetNode.contains(w))
-        ) {
+        for (let wIdx = 0; wIdx < u.wordElements.length; wIdx++) {
+          const wEl = u.wordElements[wIdx];
+          try {
+            if (!range.intersectsNode(wEl)) continue;
+            // Skip trailing edge of previous word if selection starts right at the end of its text node
+            if (
+              (wEl === range.startContainer || wEl.contains(range.startContainer)) &&
+              range.startContainer.nodeType === Node.TEXT_NODE &&
+              range.startOffset >= (range.startContainer.nodeValue?.length || 0)
+            ) {
+              continue;
+            }
+            targetIndex = i;
+            targetWordIndex = wIdx;
+            break;
+          } catch {}
+        }
+        if (targetIndex !== -1) break;
+      }
+    }
+
+    // 2. Search by DOM Node containment against word elements FIRST (avoids shared blockElement false match)
+    if (targetIndex === -1 && targetNode) {
+      for (let i = 0; i < queue.length; i++) {
+        const u = queue[i];
+        const wIdx = u.wordElements.findIndex(w => w.contains(targetNode) || targetNode.contains(w));
+        if (wIdx !== -1) {
           targetIndex = i;
+          targetWordIndex = wIdx;
           break;
         }
       }
     }
 
-    // 2. Search by text matching
-    if (targetIndex === -1 && cleanSearchText.length >= 3) {
+    // 3. Dedicated sentence element match (only when sentenceElement is NOT shared across multiple utterances)
+    if (targetIndex === -1 && targetNode) {
       for (let i = 0; i < queue.length; i++) {
-        const uText = queue[i].text.toLowerCase();
-        if (uText.includes(cleanSearchText) || cleanSearchText.includes(uText)) {
+        const u = queue[i];
+        if (
+          u.sentenceElement !== u.blockElement &&
+          (u.sentenceElement.contains(targetNode) || targetNode.contains(u.sentenceElement))
+        ) {
           targetIndex = i;
+          targetWordIndex = 0;
           break;
+        }
+      }
+    }
+
+    // 4. Text matching fallback (supports selections starting mid-sentence or spanning multiple sentences)
+    if (targetIndex === -1 && cleanSearchText.length >= 2) {
+      const searchNeedle = cleanSearchText.slice(0, 60);
+      for (let i = 0; i < queue.length; i++) {
+        const uText = queue[i].text.replace(/\s+/g, ' ').toLowerCase();
+        const matchPos = uText.indexOf(searchNeedle);
+        if (matchPos !== -1) {
+          targetIndex = i;
+          const foundWordIdx = queue[i].words.findIndex(w => w.endChar > matchPos);
+          targetWordIndex = foundWordIdx !== -1 ? foundWordIdx : 0;
+          break;
+        }
+      }
+      // If selection spans multiple sentences, check if the start of selectedText matches the tail of an utterance
+      if (targetIndex === -1) {
+        const firstWords = cleanSearchText.split(' ').slice(0, 4).join(' ');
+        if (firstWords.length >= 2) {
+          for (let i = 0; i < queue.length; i++) {
+            const uText = queue[i].text.replace(/\s+/g, ' ').toLowerCase();
+            const matchPos = uText.indexOf(firstWords);
+            if (matchPos !== -1) {
+              targetIndex = i;
+              const foundWordIdx = queue[i].words.findIndex(w => w.endChar > matchPos);
+              targetWordIndex = foundWordIdx !== -1 ? foundWordIdx : 0;
+              break;
+            }
+          }
         }
       }
     }
 
     if (targetIndex !== -1) {
       currentUtteranceIndexRef.current = targetIndex;
+      startWordOffsetRef.current = targetWordIndex;
       userScrolledRef.current = false;
       setIsAutoScrollPaused(false);
 
       if (startPlaying || ttsState.isSpeaking || (!audioRef.current?.paused && audioRef.current?.src)) {
         cleanupSpeech();
-        setTimeout(() => {
+        const nextSessionId = playbackSessionIdRef.current;
+        pendingPlayTimeoutRef.current = setTimeout(() => {
+          pendingPlayTimeoutRef.current = null;
+          if (nextSessionId !== playbackSessionIdRef.current) return;
           if (window.speechSynthesis) window.speechSynthesis.resume();
-          playQueue();
-        }, 50);
+          playQueue(nextSessionId);
+        }, 40);
       }
       return true;
     }
 
     return false;
-  }, [ttsState.isSpeaking, cleanupSpeech, playQueue]);
+  }, [ensureQueueReady, ttsState.isSpeaking, cleanupSpeech, playQueue]);
 
-  const handlePlayFromNode = useCallback((targetNode?: Node | null, selectedText?: string) => {
-    seekToTextOrNode(targetNode, selectedText, true);
+  const handlePlayFromNode = useCallback((targetNode?: Node | null, selectedText?: string, range?: Range | null) => {
+    seekToTextOrNode(targetNode, selectedText, true, range);
   }, [seekToTextOrNode]);
 
   useEffect(() => {
@@ -945,7 +1248,8 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
       if (target && container.contains(target)) {
         const sel = window.getSelection();
         const text = sel ? sel.toString().trim() : '';
-        seekToTextOrNode(target, text, true);
+        const range = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+        seekToTextOrNode(target, text, true, range);
       }
     };
 
@@ -953,68 +1257,128 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
     return () => {
       container.removeEventListener('dblclick', handleDblClick);
     };
-  }, [seekToTextOrNode, contentRef]);
+  }, [seekToTextOrNode, contentRef, activeDocumentId, isDocumentVisible]);
 
-  const handlePlay = useCallback(() => {
+  const handlePlay = useCallback((selectionFallback?: { range?: Range; text?: string } | null) => {
     if (!contentRef.current || !ttsState.selectedVoice) return;
 
+    ensureQueueReady();
     userScrolledRef.current = false;
     setIsAutoScrollPaused(false);
+
+    // Check live browser selection first, then fallback to saved selectionInfo
+    let activeRange: Range | null = null;
+    let activeText = '';
 
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
       const range = sel.getRangeAt(0);
       const text = sel.toString().trim();
       if (text && contentRef.current.contains(range.commonAncestorContainer)) {
-        seekToTextOrNode(range.startContainer, text, true);
+        activeRange = range.cloneRange();
+        activeText = text;
+      }
+    }
+
+    if (!activeText && selectionFallback?.text) {
+      const fbRange = selectionFallback.range || null;
+      const isRangeInDoc = fbRange && contentRef.current.contains(fbRange.commonAncestorContainer);
+      activeRange = isRangeInDoc ? fbRange : null;
+      activeText = selectionFallback.text.trim();
+    }
+
+    if (activeText) {
+      const matched = seekToTextOrNode(activeRange?.startContainer || null, activeText, true, activeRange);
+      if (matched) {
+        if (sel && !sel.isCollapsed) {
+          sel.removeAllRanges();
+        }
         return;
       }
     }
 
     if (ttsState.isPaused) {
-      if (ttsState.selectedVoice.isElevenLabs || ttsState.selectedVoice.isOpenAI) {
-        if (!audioRef.current?.src || audioRef.current.src.endsWith('/')) {
-          playQueue();
-        } else {
-          audioRef.current?.play();
-        }
+      const hasPausedAudio = Boolean(
+        audioRef.current &&
+        audioRef.current.getAttribute('src') &&
+        audioRef.current.paused &&
+        !audioRef.current.ended
+      );
+
+      if (hasPausedAudio && audioRef.current) {
+        const currentSession = playbackSessionIdRef.current;
+        audioRef.current.play().then(() => {
+          if (currentSession === playbackSessionIdRef.current && audioRef.current) {
+            syncWordsWithAudio(activeWordsRef.current, audioRef.current, currentSession);
+          }
+        }).catch(() => {
+          cleanupSpeech();
+          playQueue(playbackSessionIdRef.current);
+        });
+        setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
+      } else if (typeof window !== 'undefined' && window.speechSynthesis?.paused) {
+        window.speechSynthesis.resume();
+        setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
       } else {
-        if (!window.speechSynthesis.speaking) {
-          playQueue();
-        } else {
-          window.speechSynthesis.resume();
-        }
+        cleanupSpeech();
+        const nextSessionId = playbackSessionIdRef.current;
+        pendingPlayTimeoutRef.current = setTimeout(() => {
+          pendingPlayTimeoutRef.current = null;
+          if (nextSessionId !== playbackSessionIdRef.current) return;
+          if (window.speechSynthesis) window.speechSynthesis.resume();
+          playQueue(nextSessionId);
+        }, 40);
       }
-      setTtsState(prev => ({ ...prev, isSpeaking: true, isPaused: false }));
     } else {
       cleanupSpeech();
+      startWordOffsetRef.current = 0;
       if (currentUtteranceIndexRef.current >= utteranceQueueRef.current.length) {
         currentUtteranceIndexRef.current = 0;
       }
-      setTimeout(() => {
+      const nextSessionId = playbackSessionIdRef.current;
+      pendingPlayTimeoutRef.current = setTimeout(() => {
+        pendingPlayTimeoutRef.current = null;
+        if (nextSessionId !== playbackSessionIdRef.current) return;
         if (window.speechSynthesis) window.speechSynthesis.resume();
-        playQueue();
-      }, 50);
+        playQueue(nextSessionId);
+      }, 40);
     }
-  }, [contentRef, ttsState.isPaused, ttsState.selectedVoice, playQueue, cleanupSpeech, seekToTextOrNode]);
+  }, [contentRef, ensureQueueReady, ttsState.isPaused, ttsState.selectedVoice, playQueue, cleanupSpeech, seekToTextOrNode, syncWordsWithAudio]);
 
   const handlePause = useCallback(() => {
-    if (audioRafRef.current) {
-      cancelAnimationFrame(audioRafRef.current);
-      audioRafRef.current = null;
-    }
-    if (ttsState.selectedVoice?.isOpenAI || ttsState.selectedVoice?.isElevenLabs) {
-      audioRef.current?.pause();
-    } else {
+    const isPlayingAudio = Boolean(audioRef.current && audioRef.current.getAttribute('src') && !audioRef.current.paused);
+    const isPlayingNative = Boolean(typeof window !== 'undefined' && window.speechSynthesis?.speaking);
+
+    if (isPlayingAudio && audioRef.current) {
+      if (audioRafRef.current) {
+        cancelAnimationFrame(audioRafRef.current);
+        audioRafRef.current = null;
+      }
+      audioRef.current.pause();
+    } else if (isPlayingNative) {
+      // Leave nativeFallbackRafRef idling while speechSynthesis.paused === true so resume continues smoothly
       window.speechSynthesis.pause();
+    } else {
+      // Abort any in-flight TTS fetch so it doesn't begin playing after user clicked Pause
+      stopHighlightAnimLoops();
+      playbackSessionIdRef.current += 1;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      if (pendingPlayTimeoutRef.current) {
+        clearTimeout(pendingPlayTimeoutRef.current);
+        pendingPlayTimeoutRef.current = null;
+      }
     }
     setTtsState(prev => ({ ...prev, isSpeaking: false, isPaused: true }));
-  }, [ttsState.selectedVoice]);
+  }, [stopHighlightAnimLoops]);
 
   const handleStop = useCallback(() => {
     cleanupSpeech();
     setTtsState(prev => ({ ...prev, isSpeaking: false, isPaused: false }));
     currentUtteranceIndexRef.current = 0;
+    startWordOffsetRef.current = 0;
     userScrolledRef.current = false;
     setIsAutoScrollPaused(false);
   }, [cleanupSpeech]);
@@ -1044,8 +1408,10 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
   useEffect(() => {
     let timeoutId: NodeJS.Timeout;
     if (resumePlaybackRef.current) {
+      const nextSessionId = playbackSessionIdRef.current;
       timeoutId = setTimeout(() => {
-        playQueue();
+        if (nextSessionId !== playbackSessionIdRef.current) return;
+        playQueue(nextSessionId);
         resumePlaybackRef.current = false;
       }, 100);
     }
@@ -1053,23 +1419,28 @@ export const useSpeech = (contentRef: RefObject<HTMLDivElement | null>, fileCont
   }, [ttsState.selectedVoice, playQueue]);
 
   const skipSentence = useCallback((direction: 'next' | 'previous') => {
-    if (utteranceQueueRef.current.length === 0) return;
+    const queue = ensureQueueReady();
+    if (queue.length === 0) return;
     cleanupSpeech();
+    startWordOffsetRef.current = 0;
     userScrolledRef.current = false;
     setIsAutoScrollPaused(false);
 
     let newIndex;
     if (direction === 'next') {
-      newIndex = Math.min(currentUtteranceIndexRef.current + 1, utteranceQueueRef.current.length - 1);
+      newIndex = Math.min(currentUtteranceIndexRef.current + 1, queue.length - 1);
     } else {
       newIndex = Math.max(0, currentUtteranceIndexRef.current - 1);
     }
 
     currentUtteranceIndexRef.current = newIndex;
-    setTimeout(() => {
-      playQueue();
-    }, 50);
-  }, [cleanupSpeech, playQueue]);
+    const nextSessionId = playbackSessionIdRef.current;
+    pendingPlayTimeoutRef.current = setTimeout(() => {
+      pendingPlayTimeoutRef.current = null;
+      if (nextSessionId !== playbackSessionIdRef.current) return;
+      playQueue(nextSessionId);
+    }, 40);
+  }, [ensureQueueReady, cleanupSpeech, playQueue]);
 
   const handleNextSentence = useCallback(() => skipSentence('next'), [skipSentence]);
   const handlePreviousSentence = useCallback(() => skipSentence('previous'), [skipSentence]);

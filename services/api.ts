@@ -309,36 +309,40 @@ export const fetchAndCleanUrl = async (url: string): Promise<{ content: string; 
   };
 };
 
-export const generateNotes = async (htmlContent: string): Promise<string> => {
+export const generateNotes = async (htmlContent: string, isSelection: boolean = false): Promise<string> => {
   if (!htmlContent) return '';
 
   const response = await fetchWithAuth('/api/gemini/generate-notes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ htmlContent }),
+    body: JSON.stringify({ htmlContent, isSelection }),
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ error: 'Failed to generate notes' }));
-    throw new Error(errorData.error || 'Failed to generate notes.');
+    const errorData = await response.json().catch(() => ({ error: 'Falha ao gerar notas' }));
+    throw new Error(errorData.error || 'Falha ao gerar notas.');
   }
 
   const data = await response.json();
   return data.notes || '';
 };
 
-export const translateContent = async (htmlContent: string, targetLanguage: string = 'pt-BR'): Promise<string> => {
+export const translateContent = async (
+  htmlContent: string,
+  targetLanguage: string = 'pt-BR',
+  isSelection: boolean = false
+): Promise<string> => {
   if (!htmlContent) return '';
 
   const response = await fetchWithAuth('/api/gemini/translate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ htmlContent, targetLanguage }),
+    body: JSON.stringify({ htmlContent, targetLanguage, isSelection }),
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ error: 'Failed to translate content' }));
-    throw new Error(errorData.error || 'Failed to translate content.');
+    const errorData = await response.json().catch(() => ({ error: 'Falha ao traduzir conteúdo' }));
+    throw new Error(errorData.error || 'Falha ao traduzir conteúdo.');
   }
 
   const data = await response.json();

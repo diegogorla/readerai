@@ -1,0 +1,290 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user account, subscription tier, and free-tier usage counters.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the user."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254,
+          "description": "Verified email address of the user."
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Display name shown in the reader UI."
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Profile avatar URL."
+        },
+        "plan": {
+          "type": "string",
+          "enum": ["free", "pro"],
+          "description": "Active subscription tier (server/admin managed)."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "admin"],
+          "description": "Authorization role (admin managed)."
+        },
+        "planType": {
+          "type": "string",
+          "enum": ["none", "monthly", "annual", "lifetime"],
+          "description": "Billing cadence for Pro subscriptions."
+        },
+        "categories": {
+          "type": "array",
+          "description": "Custom categories for Smart List (max 20 items)."
+        },
+        "usageFile": {
+          "type": "number",
+          "description": "Number of file readings used."
+        },
+        "usageUrl": {
+          "type": "number",
+          "description": "Number of URL readings used."
+        },
+        "usageText": {
+          "type": "number",
+          "description": "Number of direct text readings used."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when user profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when user profile was last updated."
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "plan",
+        "role",
+        "planType",
+        "categories",
+        "usageFile",
+        "usageUrl",
+        "usageText",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SavedDocument": {
+      "title": "SavedDocument",
+      "description": "User document persisted in Firestore with highlights and study notes.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique document ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the document owner."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Document display title."
+        },
+        "filename": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Original filename or source label."
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 250000,
+          "description": "Sanitized HTML content of the document."
+        },
+        "originalContent": {
+          "type": "string",
+          "maxLength": 250000,
+          "description": "Original HTML content prior to edits or translations."
+        },
+        "contentType": {
+          "type": "string",
+          "enum": ["html", "url"],
+          "description": "Format of the content."
+        },
+        "sourceUrl": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Optional source URL when imported from the web."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["file", "drive", "url", "direct_text"],
+          "description": "Document import source type."
+        },
+        "highlights": {
+          "type": "array",
+          "description": "List of text highlights (max 200)."
+        },
+        "comments": {
+          "type": "array",
+          "description": "List of notes and AI summaries attached to the document (max 200)."
+        },
+        "isMinimized": {
+          "type": "boolean",
+          "description": "Whether the document panel is minimized."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when document was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when document was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "filename",
+        "content",
+        "originalContent",
+        "contentType",
+        "type",
+        "highlights",
+        "comments",
+        "isMinimized",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SmartListItem": {
+      "title": "SmartListItem",
+      "description": "User reading/study checklist item with optional Pro alarm.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique item ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the item owner."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Item title."
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Category label (restricted to 2 defaults on free plan)."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Optional notes for the item."
+        },
+        "completed": {
+          "type": "boolean",
+          "description": "Completion state."
+        },
+        "hasAlarm": {
+          "type": "boolean",
+          "description": "Whether an alarm is enabled (Pro only)."
+        },
+        "alarmTime": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Optional ISO datetime string for the alarm."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when item was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when item was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "category",
+        "notes",
+        "completed",
+        "hasAlarm",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Privileged admin user record.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Admin UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254,
+          "description": "Admin verified email."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp."
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile, subscription status, and usage counters."
+    },
+    "/users/{userId}/documents/{docId}": {
+      "schema": { "$ref": "#/entities/SavedDocument" },
+      "description": "Persisted reading documents with highlights and AI notes."
+    },
+    "/users/{userId}/items/{itemId}": {
+      "schema": { "$ref": "#/entities/SmartListItem" },
+      "description": "Smart List tasks and study reminders."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Trusted administrator lookup table."
+    }
+  }
+}

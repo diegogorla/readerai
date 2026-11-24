@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Voice } from '../types';
 import { useAuth } from '../hooks/useAuth';
+import { fetchWithAuth } from '../lib/authHelper';
 import { 
   SUPPORTED_LANGUAGES, 
   getVoiceLanguageCodes, 
@@ -70,7 +71,7 @@ export const VoiceSelectorModal: React.FC<VoiceSelectorModalProps> = ({
     // 0. ElevenLabs Voice (Dgorla & Cloned Voices)
     if (voice.isElevenLabs || voice.provider === 'elevenlabs') {
       try {
-        const response = await fetch('/api/elevenlabs/tts', {
+        const response = await fetchWithAuth('/api/elevenlabs/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: sampleText, voiceId: voice.id })
@@ -92,7 +93,7 @@ export const VoiceSelectorModal: React.FC<VoiceSelectorModalProps> = ({
     // 1. Gemini Voice
     if (voice.isGemini) {
       try {
-        const response = await fetch('/api/gemini/tts', {
+        const response = await fetchWithAuth('/api/gemini/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: sampleText, voiceName: voice.id })
@@ -114,7 +115,7 @@ export const VoiceSelectorModal: React.FC<VoiceSelectorModalProps> = ({
     // 2. Microsoft Antonio Voice
     if (voice.isMicrosoft || voice.id === 'ms-antonio-neural') {
       try {
-        const response = await fetch('/api/microsoft/tts', {
+        const response = await fetchWithAuth('/api/microsoft/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: sampleText, voiceName: 'pt-BR-AntonioNeural' })
@@ -136,7 +137,7 @@ export const VoiceSelectorModal: React.FC<VoiceSelectorModalProps> = ({
     // 3. OpenAI Voice
     if (voice.isOpenAI) {
       try {
-        const response = await fetch('/api/openai/tts', {
+        const response = await fetchWithAuth('/api/openai/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: sampleText, voiceName: voice.id }),

@@ -1,6 +1,9 @@
+export type HighlightColor = 'yellow' | 'green' | 'blue' | 'pink' | 'purple' | 'orange';
+
 export interface Highlight {
   id: string;
   text: string;
+  color?: HighlightColor;
 }
 
 export interface Comment {

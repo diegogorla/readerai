@@ -5,23 +5,20 @@ export const getAuthToken = async (): Promise<string | null> => {
     try {
       return await auth.currentUser.getIdToken();
     } catch (e) {
-      console.warn("Failed to get Firebase ID token:", e);
+      console.warn('Failed to get Firebase ID token:', e);
     }
-  }
-  const sessionToken = localStorage.getItem('readerai_session_token');
-  if (sessionToken) {
-    return sessionToken;
   }
   return null;
 };
 
 export const fetchWithAuth = async (url: string, options: RequestInit = {}) => {
   const token = await getAuthToken();
+  const headers = new Headers(options.headers || {});
   if (token) {
-    options.headers = {
-      ...options.headers,
-      'Authorization': `Bearer ${token}`
-    };
+    headers.set('Authorization', `Bearer ${token}`);
   }
-  return fetch(url, options);
+  return fetch(url, {
+    ...options,
+    headers,
+  });
 };

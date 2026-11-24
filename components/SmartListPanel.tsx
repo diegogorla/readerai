@@ -8,6 +8,26 @@ import {
 import { ListItem, Voice } from '../types';
 import { useAuth } from '../hooks/useAuth';
 import { fetchWithAuth } from '../lib/authHelper';
+import {
+  db,
+  FREE_CATEGORIES,
+  OperationType,
+  handleFirestoreError,
+  buildFirestoreItemCreatePayload,
+  mapItemSnapToListItem,
+  sanitizeId,
+} from '../lib/firebase';
+import {
+  collection,
+  doc,
+  onSnapshot,
+  query,
+  where,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  serverTimestamp,
+} from 'firebase/firestore';
 
 interface SmartListPanelProps {
   isOpen: boolean;
@@ -24,11 +44,11 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
   onSpeakText,
   selectedVoice
 }) => {
-  const { user, userData } = useAuth();
-  const isPro = userData?.plan === 'pro';
+  const { user, userData, authReady, isPro, trialDaysRemaining, isTrialExpired } = useAuth();
 
   const [items, setItems] = useState<ListItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [panelError, setPanelError] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState('');
   const [newCategory, setNewCategory] = useState('Geral');
   const [newNotes, setNewNotes] = useState('');
@@ -43,41 +63,46 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
   const audioChunksRef = useRef<Blob[]>([]);
 
   // Default and available categories
-  const freeCategories = ['Geral', 'Leituras & Estudos'];
+  const freeCategories = [...FREE_CATEGORIES];
   const categories = isPro 
     ? Array.from(new Set([...freeCategories, ...(userData?.categories || []), ...items.map(i => i.category)]))
     : freeCategories;
 
   // Active items count (not completed)
   const activeItemsCount = items.filter(i => !i.completed).length;
+  const isPast7Days = isTrialExpired;
 
-  // Check 7 days trial condition
-  const createdAtTime = new Date(userData?.createdAt || Date.now()).getTime();
-  const isPast7Days = (Date.now() - createdAtTime) > (7 * 24 * 60 * 60 * 1000);
-  const trialDaysRemaining = Math.max(0, 7 - Math.floor((Date.now() - createdAtTime) / (24 * 60 * 60 * 1000)));
-
-  // Load items from backend
-  const loadItems = async () => {
-    if (!user) return;
-    try {
-      setLoading(true);
-      const res = await fetchWithAuth('/api/items');
-      if (res.ok) {
-        const data = await res.json();
-        setItems(data.items || []);
-      }
-    } catch (err) {
-      console.error("Error loading items:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Real-time Firestore listener for user's Smart List items
   useEffect(() => {
-    if (isOpen && user) {
-      loadItems();
+    if (!authReady || !user) {
+      setItems([]);
+      return;
     }
-  }, [isOpen, user]);
+
+    setLoading(true);
+    const itemsPath = `users/${user.uid}/items`;
+    const itemsQuery = query(
+      collection(db, 'users', user.uid, 'items'),
+      where('ownerId', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(
+      itemsQuery,
+      (snapshot) => {
+        const loaded = snapshot.docs
+          .map((d) => mapItemSnapToListItem(d.id, d.data()))
+          .sort((a, b) => b.createdAt - a.createdAt);
+        setItems(loaded);
+        setLoading(false);
+      },
+      (error) => {
+        setLoading(false);
+        handleFirestoreError(error, OperationType.LIST, itemsPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [authReady, user]);
 
   // Check alarms in background
   useEffect(() => {
@@ -112,86 +137,80 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
     }
   }, [isPro]);
 
-  // Add Item Handler with Strict Checks
+  // Add Item Handler with Strict Checks + Firestore Persistence
   const handleAddItem = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTitle.trim()) return;
+    setPanelError(null);
+    if (!newTitle.trim() || !user) return;
 
-    // Rule 1: After 7 days, user without subscription must be shown plans page on inserting an item
     if (!isPro && isPast7Days) {
       onOpenSubscription("Seu período de teste gratuito de 7 dias expirou. Escolha um plano promocional para continuar inserindo itens.");
       return;
     }
 
-    // Rule 2: Free tier is limited to 5 active items
     if (!isPro && activeItemsCount >= 5) {
       onOpenSubscription("Limite gratuito atingido! O plano gratuito permite no máximo 5 itens ativos na lista. Assine o plano Pro para adicionar itens ilimitados.");
       return;
     }
 
-    // Rule 3: Alarms only on paid plans
     if (!isPro && hasAlarm) {
       onOpenSubscription("O recurso de alarme (aviso) com alerta sonoro e notificação só está disponível nos planos pagos.");
       return;
     }
 
+    const safeCategory = isPro
+      ? (newCategory.trim() || 'Geral')
+      : (freeCategories.includes(newCategory as any) ? newCategory : 'Geral');
+
+    const itemId = sanitizeId(`item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+    const itemPath = `users/${user.uid}/items/${itemId}`;
+    const payload = buildFirestoreItemCreatePayload(user.uid, {
+      id: itemId,
+      title: newTitle.trim(),
+      category: safeCategory,
+      notes: newNotes.trim(),
+      hasAlarm: isPro ? hasAlarm : false,
+      alarmTime: isPro && hasAlarm ? alarmTime : null,
+    });
+
     try {
-      const res = await fetchWithAuth('/api/items', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: newTitle.trim(),
-          category: newCategory,
-          notes: newNotes.trim(),
-          hasAlarm: isPro ? hasAlarm : false,
-          alarmTime: isPro && hasAlarm ? alarmTime : null
-        })
-      });
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        if (errorData.requiresSubscription) {
-          onOpenSubscription(errorData.message);
-          return;
-        }
-        alert(errorData.error || "Erro ao adicionar item.");
-        return;
-      }
-
-      const created = await res.json();
-      setItems(prev => [created, ...prev]);
+      await setDoc(doc(db, 'users', user.uid, 'items', itemId), payload);
       setNewTitle('');
       setNewNotes('');
       setHasAlarm(false);
       setAlarmTime('');
     } catch (err: any) {
-      console.error("Error creating item:", err);
-      alert("Falha ao comunicar com o servidor.");
+      setPanelError('Não foi possível salvar o item no Firestore.');
+      handleFirestoreError(err, OperationType.CREATE, itemPath);
     }
   };
 
   // Toggle Completed
   const handleToggleComplete = async (item: ListItem) => {
+    if (!user) return;
+    setPanelError(null);
+    const itemPath = `users/${user.uid}/items/${item.id}`;
     try {
-      const updatedStatus = !item.completed;
-      setItems(prev => prev.map(i => i.id === item.id ? { ...i, completed: updatedStatus } : i));
-      await fetchWithAuth(`/api/items/${item.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ completed: updatedStatus })
+      await updateDoc(doc(db, 'users', user.uid, 'items', item.id), {
+        completed: !item.completed,
+        updatedAt: serverTimestamp(),
       });
     } catch (err) {
-      console.error("Error updating item status:", err);
+      setPanelError('Erro ao atualizar status do item.');
+      handleFirestoreError(err, OperationType.UPDATE, itemPath);
     }
   };
 
   // Delete Item
   const handleDeleteItem = async (id: string) => {
+    if (!user) return;
+    setPanelError(null);
+    const itemPath = `users/${user.uid}/items/${id}`;
     try {
-      setItems(prev => prev.filter(i => i.id !== id));
-      await fetchWithAuth(`/api/items/${id}`, { method: 'DELETE' });
+      await deleteDoc(doc(db, 'users', user.uid, 'items', id));
     } catch (err) {
-      console.error("Error deleting item:", err);
+      setPanelError('Erro ao excluir item.');
+      handleFirestoreError(err, OperationType.DELETE, itemPath);
     }
   };
 
@@ -236,8 +255,8 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
             });
 
             if (!response.ok) {
-              const err = await response.json();
-              alert(err.message || "Erro na transcrição");
+              const err = await response.json().catch(() => ({}));
+              setPanelError(err.message || err.error || "Erro na transcrição.");
               return;
             }
 
@@ -247,7 +266,7 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
             }
           } catch (transcribeErr) {
             console.error("Transcription error:", transcribeErr);
-            alert("Falha ao transcrever voz.");
+            setPanelError("Falha ao transcrever voz.");
           } finally {
             setIsRecording(false);
             setRecordingStatus(null);
@@ -262,7 +281,7 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
       setRecordingStatus("Gravando... Fale o item a adicionar");
     } catch (err) {
       console.error("Mic access error:", err);
-      alert("Acesso ao microfone não autorizado ou indisponível.");
+      setPanelError("Acesso ao microfone não autorizado ou indisponível.");
     }
   };
 
@@ -282,7 +301,7 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
 
     const activeList = items.filter(i => !i.completed);
     if (activeList.length === 0) {
-      alert("Sua lista não possui itens ativos pendentes.");
+      setPanelError("Sua lista não possui itens ativos pendentes.");
       return;
     }
 
@@ -369,6 +388,19 @@ export const SmartListPanel: React.FC<SmartListPanelProps> = ({
               className="font-bold underline underline-offset-2 hover:text-amber-950 dark:hover:text-amber-100 ml-2 shrink-0"
             >
               Ver Planos Promocionais
+            </button>
+          </div>
+        )}
+
+        {/* Inline Error Notice */}
+        {panelError && (
+          <div className="bg-red-50 dark:bg-red-950/40 border-b border-red-200 dark:border-red-900/50 px-4 py-2 flex items-center justify-between text-xs text-red-700 dark:text-red-300">
+            <div className="flex items-center gap-2">
+              <AlertCircle size={15} className="shrink-0" />
+              <span>{panelError}</span>
+            </div>
+            <button onClick={() => setPanelError(null)} className="p-1 hover:bg-red-100 dark:hover:bg-red-900/50 rounded-lg">
+              <X size={14} />
             </button>
           </div>
         )}

@@ -1,0 +1,324 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Default-deny global safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Global Hardened Helpers (Phase 3 & Phase 5 Red Team Patched)
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Zero-DB-read admin check safe for list queries (Pillar 8 compliant)
+    function isBootstrapAdmin() {
+      return isVerified() && request.auth.token.email == 'dgorla@gmail.com';
+    }
+
+    // Full admin check for single-document operations
+    function isAdmin() {
+      return isBootstrapAdmin() || (
+        isVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidCategoriesList(cats) {
+      return cats is list &&
+        cats.size() <= 20 &&
+        (cats.size() == 0 || (cats[0] is string && cats[0].size() >= 1 && cats[0].size() <= 80));
+    }
+
+    function isValidHighlightsList(items) {
+      return items is list &&
+        items.size() <= 200 &&
+        (items.size() == 0 || (items[0] is map && items[0].keys().hasOnly(['id', 'text', 'color'])));
+    }
+
+    function isValidCommentsList(items) {
+      return items is list &&
+        items.size() <= 200 &&
+        (items.size() == 0 || (items[0] is map && items[0].keys().hasOnly(['id', 'highlightId', 'text', 'createdAt', 'updatedAt'])));
+    }
+
+    // =========================================================================
+    // Entity Validation Blueprints (Pillar 2 - Anti-Update-Gap)
+    // =========================================================================
+    function isValidUser(data, userId) {
+      return data.keys().hasAll([
+          'uid', 'email', 'displayName', 'plan', 'role', 'planType',
+          'categories', 'usageFile', 'usageUrl', 'usageText', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'photoURL', 'plan', 'role', 'planType',
+          'categories', 'usageFile', 'usageUrl', 'usageText', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.uid == userId &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.displayName is string && data.displayName.size() <= 120 &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+        data.plan in ['free', 'pro'] &&
+        data.role in ['user', 'admin'] &&
+        data.planType in ['none', 'monthly', 'annual', 'lifetime'] &&
+        isValidCategoriesList(data.categories) &&
+        data.usageFile is int && data.usageFile >= 0 && data.usageFile <= 1000000 &&
+        data.usageUrl is int && data.usageUrl >= 0 && data.usageUrl <= 1000000 &&
+        data.usageText is int && data.usageText >= 0 && data.usageText <= 1000000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidDocument(data, userId, docId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'title', 'filename', 'content', 'originalContent',
+          'contentType', 'type', 'highlights', 'comments', 'isMinimized', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'title', 'filename', 'content', 'originalContent',
+          'contentType', 'sourceUrl', 'type', 'highlights', 'comments', 'isMinimized', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == docId &&
+        isValidId(data.ownerId) &&
+        data.ownerId == userId &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 300 &&
+        data.filename is string && data.filename.size() >= 1 && data.filename.size() <= 300 &&
+        data.content is string && data.content.size() <= 250000 &&
+        data.originalContent is string && data.originalContent.size() <= 250000 &&
+        data.contentType in ['html', 'url'] &&
+        (!('sourceUrl' in data) || (data.sourceUrl is string && data.sourceUrl.size() <= 2048)) &&
+        data.type in ['file', 'drive', 'url', 'direct_text'] &&
+        isValidHighlightsList(data.highlights) &&
+        isValidCommentsList(data.comments) &&
+        data.isMinimized is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSmartListItem(data, userId, itemId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'title', 'category', 'notes', 'completed', 'hasAlarm', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'title', 'category', 'notes', 'completed', 'hasAlarm', 'alarmTime', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == itemId &&
+        isValidId(data.ownerId) &&
+        data.ownerId == userId &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 300 &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 80 &&
+        data.notes is string && data.notes.size() <= 2000 &&
+        data.completed is bool &&
+        data.hasAlarm is bool &&
+        (!('alarmTime' in data) || (data.alarmTime is string && data.alarmTime.size() <= 64)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRecord(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.uid == userId &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.createdAt is timestamp;
+    }
+
+    // Master Gate helpers for subcollections (called only on single-doc ops)
+    function parentUserExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    function isParentUserPro(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro';
+    }
+
+    // =========================================================================
+    // Collection: /admins/{userId}
+    // =========================================================================
+    match /admins/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrapAdmin();
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        isValidAdminRecord(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        isAdmin();
+      allow update: if false;
+      allow delete: if isVerified() && isValidId(userId) && isAdmin();
+    }
+
+    // =========================================================================
+    // Collection: /users/{userId} (PII strictly isolated)
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrapAdmin();
+
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        isOwner(userId) &&
+        isValidUser(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().email == request.auth.token.email &&
+        (
+          isAdmin() ||
+          (incoming().plan == 'free' && incoming().role == 'user' && incoming().planType == 'none')
+        );
+
+      allow update: if isVerified() &&
+        isValidId(userId) &&
+        isValidUser(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action 1: Admin subscription/role management
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName', 'photoURL', 'plan', 'role', 'planType', 'categories',
+            'usageFile', 'usageUrl', 'usageText', 'updatedAt'
+          ])) ||
+          // Action 2: Owner updates profile or increments usage counters (never plan/role)
+          (isOwner(userId) &&
+            incoming().plan == existing().plan &&
+            incoming().role == existing().role &&
+            incoming().planType == existing().planType &&
+            (incoming().plan == 'pro' || incoming().categories == existing().categories) &&
+            incoming().usageFile >= existing().usageFile &&
+            incoming().usageUrl >= existing().usageUrl &&
+            incoming().usageText >= existing().usageText &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'photoURL', 'categories', 'usageFile', 'usageUrl', 'usageText', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(userId) && isAdmin();
+
+      // =======================================================================
+      // Subcollection: /users/{userId}/documents/{docId}
+      // =======================================================================
+      match /documents/{docId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(docId) && (isOwner(userId) || isAdmin());
+        allow list: if isSignedIn() && (
+          (request.auth.uid == userId && resource.data.ownerId == request.auth.uid) ||
+          isBootstrapAdmin()
+        );
+
+        allow create: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isOwner(userId) &&
+          isValidDocument(incoming(), userId, docId) &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(userId);
+
+        allow update: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidDocument(incoming(), userId, docId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(userId) && (
+            isAdmin() ||
+            (isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'title', 'content', 'highlights', 'comments', 'isMinimized', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          (isOwner(userId) || isAdmin()) &&
+          parentUserExists(userId);
+      }
+
+      // =======================================================================
+      // Subcollection: /users/{userId}/items/{itemId}
+      // =======================================================================
+      match /items/{itemId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(itemId) && (isOwner(userId) || isAdmin());
+        allow list: if isSignedIn() && (
+          (request.auth.uid == userId && resource.data.ownerId == request.auth.uid) ||
+          isBootstrapAdmin()
+        );
+
+        allow create: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(itemId) &&
+          isOwner(userId) &&
+          isValidSmartListItem(incoming(), userId, itemId) &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(userId) && (
+            isAdmin() ||
+            isParentUserPro(userId) ||
+            (incoming().hasAlarm == false && incoming().category in ['Geral', 'Leituras & Estudos'])
+          );
+
+        allow update: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(itemId) &&
+          isValidSmartListItem(incoming(), userId, itemId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(userId) && (
+            isAdmin() ||
+            // Action 1: Toggle completion status
+            (isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['completed', 'updatedAt'])
+            ) ||
+            // Action 2: Edit item fields (with Free-tier alarm/category enforcement)
+            (isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'title', 'category', 'notes', 'completed', 'hasAlarm', 'alarmTime', 'updatedAt'
+              ]) && (
+                isParentUserPro(userId) ||
+                (incoming().hasAlarm == false && incoming().category in ['Geral', 'Leituras & Estudos'])
+              )
+            )
+          );
+
+        allow delete: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(itemId) &&
+          (isOwner(userId) || isAdmin()) &&
+          parentUserExists(userId);
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { X, MessageSquare, Trash2, Quote, Play, Square, Volume2, Sparkles, Pencil, Check } from 'lucide-react';
 import { Comment, Highlight, Voice } from '../types';
+import { fetchWithAuth } from '../lib/authHelper';
 
 interface CommentSidebarProps {
   comments: Comment[];
@@ -112,7 +113,7 @@ export const CommentSidebar: React.FC<CommentSidebarProps> = ({
 
     if (selectedVoice?.isElevenLabs || selectedVoice?.provider === 'elevenlabs') {
       try {
-        const response = await fetch('/api/elevenlabs/tts', {
+        const response = await fetchWithAuth('/api/elevenlabs/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: fullTextToRead, voiceId: selectedVoice.id }),
@@ -141,10 +142,10 @@ export const CommentSidebar: React.FC<CommentSidebarProps> = ({
 
     if (selectedVoice?.isOpenAI) {
       try {
-        const response = await fetch('/api/openai/tts', {
+        const response = await fetchWithAuth('/api/openai/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: fullTextToRead }),
+          body: JSON.stringify({ text: fullTextToRead, voiceName: selectedVoice.id }),
         });
 
         if (!response.ok) throw new Error('OpenAI TTS failed');
